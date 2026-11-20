@@ -8,6 +8,10 @@ use windows::Win32::NetworkManagement::NetManagement::{
 };
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{LookupAccountNameW, PSID, SID_NAME_USE};
+use windows::Win32::System::RemoteDesktop::{
+    WTSDomainName, WTSFreeMemory, WTSQuerySessionInformationW, WTSUserName, WTS_CURRENT_SESSION,
+};
+use windows::Win32::System::WindowsProgramming::GetComputerNameW;
 
 #[derive(Debug, Clone)]
 pub struct UserInfo {
@@ -23,10 +27,15 @@ pub struct UserInfo {
 /// user instead of the elevated process token. This helper is the initial
 /// bridge until that is wired in.
 pub fn current_user() -> Result<UserInfo> {
-    let username =
-        std::env::var("USERNAME").map_err(|_| AuthError::Internal("USERNAME is not set".into()))?;
-    let domain = std::env::var("USERDOMAIN").unwrap_or_else(|_| ".".into());
-    let computer = std::env::var("COMPUTERNAME").unwrap_or_else(|_| ".".into());
+    // Prefer the interactive WTS session over the elevated process token's
+    // environment, which may be a different administrator account.
+    let username = query_wts_string(WTSUserName)
+        .or_else(|| std::env::var("USERNAME").ok())
+        .ok_or_else(|| AuthError::Internal("USERNAME is not available".into()))?;
+    let domain = query_wts_string(WTSDomainName)
+        .or_else(|| std::env::var("USERDOMAIN").ok())
+        .unwrap_or_else(|| ".".into());
+    let computer = computer_name()?;
 
     let qualified = if domain == "." || domain.is_empty() {
         username.clone()
@@ -96,6 +105,35 @@ pub fn current_user() -> Result<UserInfo> {
         username,
         computer,
     })
+}
+
+fn query_wts_string(
+    class: windows::Win32::System::RemoteDesktop::WTS_INFO_CLASS,
+) -> Option<String> {
+    let mut buffer = PWSTR::null();
+    let mut bytes = 0u32;
+    unsafe {
+        WTSQuerySessionInformationW(None, WTS_CURRENT_SESSION, class, &mut buffer, &mut bytes)
+            .ok()?;
+    }
+    if buffer.is_null() {
+        return None;
+    }
+    let value = unsafe { buffer.to_string() }.ok();
+    unsafe {
+        WTSFreeMemory(buffer.0 as *mut core::ffi::c_void);
+    }
+    value
+}
+
+/// Read the computer name through Win32 rather than relying on the
+/// LogonUI/CP process environment.
+pub fn computer_name() -> Result<String> {
+    let mut length = 256u32;
+    let mut buffer = vec![0u16; length as usize];
+    unsafe { GetComputerNameW(Some(PWSTR(buffer.as_mut_ptr())), &mut length) }
+        .map_err(|error| AuthError::Internal(format!("GetComputerNameW failed: {error}")))?;
+    Ok(String::from_utf16_lossy(&buffer[..length as usize]))
 }
 
 /// Compute the approximate absolute password-set time from

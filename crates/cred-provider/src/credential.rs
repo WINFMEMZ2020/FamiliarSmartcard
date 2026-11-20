@@ -271,7 +271,7 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
             return Ok(());
         }
 
-        let computer = std::env::var("COMPUTERNAME").unwrap_or_else(|_| ".".into());
+        let computer = scard_core::account::computer_name().unwrap_or_else(|_| ".".into());
         let mut pin_bytes = Zeroizing::new(pin_text.into_bytes());
         let password = match scard_core::unlock(
             vault,
