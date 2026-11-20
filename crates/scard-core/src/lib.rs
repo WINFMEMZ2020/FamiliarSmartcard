@@ -4,6 +4,7 @@
 //! PC/SC context, one card handle, and one transaction. No background threads
 //! are created here.
 
+pub mod account;
 pub mod crypto;
 pub mod dpapi;
 pub mod enroll;
@@ -15,6 +16,7 @@ pub mod storage;
 pub mod typestate;
 pub mod vault;
 
+pub use account::{current_user, UserInfo};
 pub use enroll::{enroll, EnrollResult};
 pub use error::{AuthError, Result};
 pub use probe::{probe_readers, ReaderProbe, SlotProbe};

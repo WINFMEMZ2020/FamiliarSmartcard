@@ -130,9 +130,9 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
 
     fn GetStringValue(&self, dwfieldid: u32) -> WinResult<PWSTR> {
         let value = match dwfieldid {
-            SFI_LABEL => "RS-Key 安全密钥登录".to_string(),
+            SFI_LABEL => "Sign in with RS-Key".to_string(),
             SFI_PIN => self.pin.borrow().to_string(),
-            SFI_SUBMIT => "登录".to_string(),
+            SFI_SUBMIT => "Sign in".to_string(),
             SFI_STATUS => self.status_text(),
             _ => return Err(E_NOTIMPL.into()),
         };
@@ -180,7 +180,7 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
         let value = unsafe { psz.to_string() }.unwrap_or_default();
         let value = value.trim().to_string();
         if value.len() > 16 {
-            self.set_status("PIN 过长".into());
+            self.set_status("PIN is too long.".into());
             return Ok(());
         }
         let mut pin = self.pin.borrow_mut();
@@ -217,7 +217,12 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
 
         let pin_text = self.pin.borrow().to_string();
         if pin_text.is_empty() {
-            self.fail(ppsz_status, pcpsi, "请输入 RS-Key PIN".into(), CPSI_WARNING);
+            self.fail(
+                ppsz_status,
+                pcpsi,
+                "Enter your RS-Key PIN.".into(),
+                CPSI_WARNING,
+            );
             return Ok(());
         }
         if pin_text.len() < 6 || pin_text.len() > 8 || !pin_text.chars().all(|c| c.is_ascii_digit())
@@ -225,7 +230,7 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
             self.fail(
                 ppsz_status,
                 pcpsi,
-                "PIV PIN 必须是 6–8 位数字".into(),
+                "PIV PIN must be 6-8 digits.".into(),
                 CPSI_WARNING,
             );
             return Ok(());
@@ -237,7 +242,7 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
                 self.fail(
                     ppsz_status,
                     pcpsi,
-                    "该账户尚未绑定 RS-Key".into(),
+                    "This account is not bound to an RS-Key.".into(),
                     CPSI_ERROR,
                 );
                 return Ok(());
@@ -271,7 +276,7 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
                 self.fail(
                     ppsz_status,
                     pcpsi,
-                    format!("CredProtect 失败: {error}"),
+                    format!("CredProtect failed: {error}"),
                     CPSI_ERROR,
                 );
                 return Ok(());
@@ -284,7 +289,7 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
                 self.fail(
                     ppsz_status,
                     pcpsi,
-                    format!("KERB 打包失败: {error}"),
+                    format!("KERB packing failed: {error}"),
                     CPSI_ERROR,
                 );
                 return Ok(());
@@ -300,7 +305,7 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
                 self.fail(
                     ppsz_status,
                     pcpsi,
-                    format!("Negotiate 包查找失败: {error}"),
+                    format!("Negotiate package lookup failed: {error}"),
                     CPSI_ERROR,
                 );
                 return Ok(());
@@ -314,7 +319,7 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
             (*pcpcs).rgbSerialization = packed.pointer;
             *pcpgsr = CPGSR_RETURN_CREDENTIAL_FINISHED;
         }
-        self.set_status("正在登录…".into());
+        self.set_status("Signing in...".into());
         self.clear_pin();
         Ok(())
     }
@@ -333,15 +338,21 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
 
         let status = ntsstatus.0 as u32;
         let (message, icon) = if status == STATUS_LOGON_FAILURE {
-            ("密码错误；请检查恢复单或重新绑定。", CPSI_ERROR)
+            (
+                "Incorrect password. Check the recovery sheet or re-enroll.",
+                CPSI_ERROR,
+            )
         } else if status == STATUS_ACCOUNT_LOCKED_OUT {
-            ("账户已锁定。", CPSI_ERROR)
+            ("The account is locked out.", CPSI_ERROR)
         } else if status == STATUS_PASSWORD_EXPIRED {
-            ("密码已过期，请重新绑定。", CPSI_WARNING)
+            (
+                "The password has expired; re-enrollment is required.",
+                CPSI_WARNING,
+            )
         } else if status == STATUS_ACCOUNT_DISABLED {
-            ("账户已禁用。", CPSI_ERROR)
+            ("The account is disabled.", CPSI_ERROR)
         } else {
-            ("登录失败。", CPSI_ERROR)
+            ("Sign-in failed.", CPSI_ERROR)
         };
         self.fail(ppsz_status, pcpsi, message.into(), icon);
         Ok(())
@@ -357,10 +368,10 @@ impl ICredentialProviderCredential2_Impl for Credential_Impl {
 pub fn field_descriptor(index: u32) -> WinResult<CREDENTIAL_PROVIDER_FIELD_DESCRIPTOR> {
     let (label, cpft) = match index {
         SFI_TILEIMAGE => ("RS-Key", CPFT_TILE_IMAGE),
-        SFI_LABEL => ("RS-Key 安全密钥登录", CPFT_LARGE_TEXT),
+        SFI_LABEL => ("Sign in with RS-Key", CPFT_LARGE_TEXT),
         SFI_PIN => ("PIN", CPFT_PASSWORD_TEXT),
-        SFI_SUBMIT => ("登录", CPFT_SUBMIT_BUTTON),
-        SFI_STATUS => ("状态", CPFT_SMALL_TEXT),
+        SFI_SUBMIT => ("Sign in", CPFT_SUBMIT_BUTTON),
+        SFI_STATUS => ("Status", CPFT_SMALL_TEXT),
         _ => return Err(E_NOTIMPL.into()),
     };
 

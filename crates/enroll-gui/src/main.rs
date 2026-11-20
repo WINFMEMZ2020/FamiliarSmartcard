@@ -22,7 +22,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const ID_PROBE: usize = 1001;
 const ID_CLEAR: usize = 1002;
 
-const WINDOW_TITLE: &str = "FamiliarSmartcard 配置与诊断";
+const WINDOW_TITLE: &str = "FamiliarSmartcard Setup and Diagnostics";
 
 struct AppState {
     output: HWND,
@@ -106,7 +106,16 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 unsafe fn create_controls(hwnd: HWND) {
     let font = HFONT(GetStockObject(DEFAULT_GUI_FONT).0);
 
-    let label = create_control(hwnd, w!("STATIC"), "RS-Key / PIV 诊断", 20, 16, 400, 24, 0);
+    let label = create_control(
+        hwnd,
+        w!("STATIC"),
+        "RS-Key / PIV Diagnostics",
+        20,
+        16,
+        400,
+        24,
+        0,
+    );
     let _ = SendMessageW(
         label,
         WM_SETFONT,
@@ -117,7 +126,7 @@ unsafe fn create_controls(hwnd: HWND) {
     let probe = create_control(
         hwnd,
         w!("BUTTON"),
-        "探测卡片",
+        "Probe card",
         20,
         52,
         130,
@@ -134,7 +143,7 @@ unsafe fn create_controls(hwnd: HWND) {
     let clear = create_control(
         hwnd,
         w!("BUTTON"),
-        "清空输出",
+        "Clear output",
         160,
         52,
         130,
@@ -227,9 +236,9 @@ unsafe fn probe_and_show(hwnd: HWND) {
     };
 
     let text = match scard_core::probe_readers() {
-        Ok(readers) if readers.is_empty() => "没有找到读卡器。\r\n".to_string(),
+        Ok(readers) if readers.is_empty() => "No smart card reader found.\r\n".to_string(),
         Ok(readers) => format_readers(&readers),
-        Err(error) => format!("探测失败：{error}\r\n"),
+        Err(error) => format!("Probe failed: {error}\r\n"),
     };
 
     let wide = to_wide(&text);
@@ -239,33 +248,36 @@ unsafe fn probe_and_show(hwnd: HWND) {
 fn format_readers(readers: &[scard_core::ReaderProbe]) -> String {
     let mut out = String::new();
     for reader in readers {
-        out.push_str(&format!("读卡器: {}\r\n", reader.reader));
+        out.push_str(&format!("Reader: {}\r\n", reader.reader));
         out.push_str(&format!("  ATR: {}\r\n", reader.atr_hex));
         if reader.piv_selected {
             out.push_str(&format!(
-                "  PIV: 已选中，卡片名: {}\r\n",
-                reader.card_name.as_deref().unwrap_or("(未知)")
+                "  PIV: selected, card: {}\r\n",
+                reader.card_name.as_deref().unwrap_or("(unknown)")
             ));
-            out.push_str(&format!("  算法: {}\r\n", hex::encode(&reader.algorithms)));
+            out.push_str(&format!(
+                "  Algorithms: {}\r\n",
+                hex::encode(&reader.algorithms)
+            ));
         } else {
-            out.push_str("  PIV: 未选中\r\n");
+            out.push_str("  PIV: not selected\r\n");
         }
         if let Some(error) = &reader.error {
-            out.push_str(&format!("  错误: {error}\r\n"));
+            out.push_str(&format!("  Error: {error}\r\n"));
         }
         for slot in &reader.slots {
             out.push_str(&format!(
-                "  槽位 0x{:02X}: {}{}\r\n",
+                "  Slot 0x{:02X}: {}{}\r\n",
                 slot.slot,
                 if slot.has_key {
-                    "有密钥"
+                    "key present"
                 } else {
-                    "无密钥"
+                    "no key"
                 },
                 if slot.metadata_hex.is_empty() {
                     String::new()
                 } else {
-                    format!("，metadata={}", slot.metadata_hex)
+                    format!(", metadata={}", slot.metadata_hex)
                 }
             ));
         }

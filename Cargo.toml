@@ -26,6 +26,8 @@ windows = { version = "0.62", features = [
     "Win32_Security_Authentication_Identity",
     "Win32_Graphics_Gdi",
     "Win32_Storage_EnhancedStorage",
+    "Win32_Security",
+    "Win32_Security_Authorization",
 ] }
 zeroize = { version = "1.8", features = ["derive"] }
 aes-gcm = "0.10"
