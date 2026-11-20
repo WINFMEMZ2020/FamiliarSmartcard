@@ -38,6 +38,10 @@ struct AppState {
 }
 
 fn main() -> windows::core::Result<()> {
+    if std::env::args().any(|argument| argument == "--probe") {
+        return probe_cli();
+    }
+
     unsafe {
         let instance = GetModuleHandleW(None)?;
         let hinstance = HINSTANCE(instance.0);
@@ -78,6 +82,20 @@ fn main() -> windows::core::Result<()> {
         while GetMessageW(&mut message, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
+        }
+    }
+    Ok(())
+}
+
+fn probe_cli() -> windows::core::Result<()> {
+    match scard_core::probe_readers() {
+        Ok(readers) if readers.is_empty() => println!("No smart card reader found."),
+        Ok(readers) => print!("{}", format_readers(&readers)),
+        Err(error) => {
+            eprintln!("Probe failed: {error}");
+            return Err(windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_FAIL,
+            ));
         }
     }
     Ok(())

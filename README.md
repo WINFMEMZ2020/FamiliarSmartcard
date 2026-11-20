@@ -22,6 +22,12 @@ cargo build --workspace
 cargo test -p scard-core
 ```
 
+Headless probe (useful over RDP or in the test VM):
+
+```powershell
+cargo run -p enroll-gui -- --probe
+```
+
 Release Credential Provider:
 
 ```powershell
@@ -39,6 +45,17 @@ The DLL is `target\release\cred_provider.dll`.
 
 The card is currently not provisioned until `Slot 0x9D: key present` appears in
 the GUI probe output.
+
+## Current limitations
+
+- The GUI binds the **existing** Windows password; random-password rotation and
+  the two-phase recovery-sheet flow are not wired yet.
+- PIV 9D provisioning (management-key auth + on-card P-256 with PIN policy
+  ALWAYS + attestation pinning) must be done before binding.
+- The Credential Provider currently uses the synchronous PC/SC path in
+  `GetSerialization`; the isolated helper/timeout process is designed in the
+  plan but not implemented yet.
+- `f9` attestation verification is not implemented in the GUI yet.
 
 ## Register the Credential Provider
 
