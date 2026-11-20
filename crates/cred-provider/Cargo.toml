@@ -11,5 +11,6 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 windows.workspace = true
+windows-core = "0.62"
 zeroize.workspace = true
 scard-core = { path = "../scard-core" }

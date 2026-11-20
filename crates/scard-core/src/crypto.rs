@@ -87,12 +87,7 @@ pub fn aes_gcm_decrypt(
         .map_err(|_| AuthError::Crypto("invalid AES-256-GCM key length".into()))?;
     let mut buffer = ciphertext.to_vec();
     cipher
-        .decrypt_in_place_detached(
-            &Nonce::from(*nonce),
-            aad,
-            &mut buffer,
-            &Tag::from(*tag),
-        )
+        .decrypt_in_place_detached(&Nonce::from(*nonce), aad, &mut buffer, &Tag::from(*tag))
         .map_err(|_| AuthError::Crypto("AES-256-GCM authentication failed".into()))?;
     Ok(Zeroizing::new(buffer))
 }

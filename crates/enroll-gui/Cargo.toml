@@ -13,4 +13,5 @@ path = "src/main.rs"
 [dependencies]
 windows.workspace = true
 zeroize.workspace = true
+hex.workspace = true
 scard-core = { path = "../scard-core" }

@@ -11,6 +11,7 @@ pub mod error;
 pub mod pcsc;
 pub mod piv;
 pub mod probe;
+pub mod storage;
 pub mod typestate;
 pub mod vault;
 

@@ -95,6 +95,7 @@ version = "0.1.0"
 dependencies = [
  "scard-core",
  "windows",
+ "windows-core",
  "zeroize",
 ]
 
@@ -192,6 +193,7 @@ dependencies = [
 name = "enroll-gui"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "scard-core",
  "windows",
  "zeroize",

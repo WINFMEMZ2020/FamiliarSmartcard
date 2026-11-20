@@ -52,6 +52,9 @@ pub enum AuthError {
     #[error("DPAPI error: {0}")]
     Dpapi(String),
 
+    #[error("registry error: 0x{0:08X}")]
+    Registry(i32),
+
     #[error("unsupported operation: {0}")]
     Unsupported(&'static str),
 
