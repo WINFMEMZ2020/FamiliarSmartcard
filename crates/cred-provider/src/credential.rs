@@ -253,6 +253,24 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
             }
         };
 
+        let current_last_set = match scard_core::account::password_last_set(&self.username) {
+            Ok(value) => value,
+            Err(error) => {
+                self.fail(ppsz_status, pcpsi, error.to_string(), CPSI_ERROR);
+                return Ok(());
+            }
+        };
+        if !scard_core::vault::password_last_set_matches(vault.password_last_set, current_last_set)
+        {
+            self.fail(
+                ppsz_status,
+                pcpsi,
+                "The Windows password has changed; re-enrollment is required.".into(),
+                CPSI_ERROR,
+            );
+            return Ok(());
+        }
+
         let computer = std::env::var("COMPUTERNAME").unwrap_or_else(|_| ".".into());
         let mut pin_bytes = Zeroizing::new(pin_text.into_bytes());
         let password = match scard_core::unlock(

@@ -3,6 +3,9 @@
 use crate::error::{AuthError, Result};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{LocalFree, HLOCAL};
+use windows::Win32::NetworkManagement::NetManagement::{
+    NetApiBufferFree, NetUserGetInfo, USER_INFO_1,
+};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{LookupAccountNameW, PSID, SID_NAME_USE};
 
@@ -93,4 +96,34 @@ pub fn current_user() -> Result<UserInfo> {
         username,
         computer,
     })
+}
+
+/// Compute the approximate absolute password-set time from
+/// `USER_INFO_1::usri1_password_age` (relative seconds).
+///
+/// The value is intentionally approximate; callers must compare with the
+/// static vault value using `vault::password_last_set_matches` (±5 seconds).
+pub fn password_last_set(username: &str) -> Result<u64> {
+    let username_w: Vec<u16> = username.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut buffer: *mut u8 = std::ptr::null_mut();
+
+    let status =
+        unsafe { NetUserGetInfo(PCWSTR::null(), PCWSTR(username_w.as_ptr()), 1, &mut buffer) };
+    if status != 0 || buffer.is_null() {
+        return Err(AuthError::Internal(format!(
+            "NetUserGetInfo failed with status {status}"
+        )));
+    }
+
+    let info = unsafe { &*(buffer as *const USER_INFO_1) };
+    let age = info.usri1_password_age as u64;
+    unsafe {
+        let _ = NetApiBufferFree(Some(buffer as *const core::ffi::c_void));
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    Ok(now.saturating_sub(age))
 }

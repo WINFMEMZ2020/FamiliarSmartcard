@@ -10,9 +10,7 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE, HINSTANCE, HWND, LPARAM, L
 use windows::Win32::Graphics::Gdi::{
     GetStockObject, COLOR_WINDOW, DEFAULT_GUI_FONT, HBRUSH, HFONT,
 };
-use windows::Win32::Security::{
-    LogonUserW, LOGON32_LOGON_NETWORK, LOGON32_PROVIDER_DEFAULT,
-};
+use windows::Win32::Security::{LogonUserW, LOGON32_LOGON_NETWORK, LOGON32_PROVIDER_DEFAULT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowLongPtrW,
@@ -136,7 +134,16 @@ unsafe fn create_controls(hwnd: HWND) {
     );
     set_font(title, font);
 
-    let pin_label = create_control(hwnd, w!("STATIC"), "PIV PIN (6-8 digits)", 20, 52, 180, 22, 0);
+    let pin_label = create_control(
+        hwnd,
+        w!("STATIC"),
+        "PIV PIN (6-8 digits)",
+        20,
+        52,
+        180,
+        22,
+        0,
+    );
     set_font(pin_label, font);
     let pin = create_control(hwnd, w!("EDIT"), "", 210, 50, 180, 24, 0);
     let _ = SendMessageW(
@@ -147,16 +154,7 @@ unsafe fn create_controls(hwnd: HWND) {
     );
     set_font(pin, font);
 
-    let password_label = create_control(
-        hwnd,
-        w!("STATIC"),
-        "Windows password",
-        20,
-        86,
-        180,
-        22,
-        0,
-    );
+    let password_label = create_control(hwnd, w!("STATIC"), "Windows password", 20, 86, 180, 22, 0);
     set_font(password_label, font);
     let password = create_control(hwnd, w!("EDIT"), "", 210, 84, 360, 24, 0);
     let _ = SendMessageW(
@@ -167,7 +165,16 @@ unsafe fn create_controls(hwnd: HWND) {
     );
     set_font(password, font);
 
-    let probe = create_control(hwnd, w!("BUTTON"), "Probe card", 20, 126, 130, 32, ID_PROBE as isize);
+    let probe = create_control(
+        hwnd,
+        w!("BUTTON"),
+        "Probe card",
+        20,
+        126,
+        130,
+        32,
+        ID_PROBE as isize,
+    );
     set_font(probe, font);
     let bind = create_control(
         hwnd,
@@ -332,13 +339,15 @@ unsafe fn bind_account(hwnd: HWND) {
         return;
     }
 
+    let password_last_set = scard_core::account::password_last_set(&user.username).unwrap_or(0);
+
     let result = match scard_core::enroll(
         None,
         &password,
         &user.sid,
         &user.username,
         &user.computer,
-        0,
+        password_last_set,
     ) {
         Ok(result) => result,
         Err(error) => {
@@ -430,8 +439,16 @@ unsafe fn self_test(hwnd: HWND) {
 }
 
 fn validate_windows_password(user: &scard_core::UserInfo, password: &str) -> Result<(), String> {
-    let username: Vec<u16> = user.username.encode_utf16().chain(std::iter::once(0)).collect();
-    let domain: Vec<u16> = user.domain.encode_utf16().chain(std::iter::once(0)).collect();
+    let username: Vec<u16> = user
+        .username
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let domain: Vec<u16> = user
+        .domain
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let password_w: Vec<u16> = password.encode_utf16().chain(std::iter::once(0)).collect();
     let mut token = HANDLE::default();
 

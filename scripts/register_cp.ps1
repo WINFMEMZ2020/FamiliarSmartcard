@@ -22,6 +22,20 @@ New-Item -Path $inprocKey -Force | Out-Null
 Set-Item -Path $inprocKey -Value $dllDest
 Set-ItemProperty -Path $inprocKey -Name 'ThreadingModel' -Value 'Apartment'
 
+# Vault root: SYSTEM and Administrators only. Child user keys inherit.
+$vaultKey = 'HKLM:\SOFTWARE\FamiliarSmartcard'
+New-Item -Path $vaultKey -Force | Out-Null
+$vaultAcl = Get-Acl $vaultKey
+$vaultAcl.SetAccessRuleProtection($true, $false)
+$vaultAcl.Access | ForEach-Object { $vaultAcl.RemoveAccessRule($_) | Out-Null }
+$vaultSystem = New-Object System.Security.AccessControl.RegistryAccessRule(
+    'SYSTEM', 'FullControl', 'ContainerInherit', 'None', 'Allow')
+$vaultAdmins = New-Object System.Security.AccessControl.RegistryAccessRule(
+    'Administrators', 'FullControl', 'ContainerInherit', 'None', 'Allow')
+$vaultAcl.AddAccessRule($vaultSystem)
+$vaultAcl.AddAccessRule($vaultAdmins)
+Set-Acl -Path $vaultKey -AclObject $vaultAcl
+
 # Restrict the install directory to SYSTEM and Administrators.
 $acl = Get-Acl $installDir
 $acl.SetAccessRuleProtection($true, $false)
