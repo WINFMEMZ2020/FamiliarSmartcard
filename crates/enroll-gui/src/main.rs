@@ -38,8 +38,13 @@ struct AppState {
 }
 
 fn main() -> windows::core::Result<()> {
-    if std::env::args().any(|argument| argument == "--probe") {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|argument| argument == "--probe") {
         return probe_cli();
+    }
+    if args.get(1).map(String::as_str) == Some("--card-selftest") {
+        let pin = args.get(2).map(String::as_str).unwrap_or("123456");
+        return card_selftest(pin);
     }
 
     unsafe {
@@ -84,6 +89,55 @@ fn main() -> windows::core::Result<()> {
             DispatchMessageW(&message);
         }
     }
+    Ok(())
+}
+
+fn card_selftest(pin: &str) -> windows::core::Result<()> {
+    const TEST_PASSWORD: &str = "FamiliarSmartcard-SelfTest-Only";
+    const TEST_SID: &str = "S-1-5-21-0";
+    const TEST_USER: &str = "selftest";
+    const TEST_COMPUTER: &str = "SELFTEST";
+
+    let enrolled = scard_core::enroll(None, TEST_PASSWORD, TEST_SID, TEST_USER, TEST_COMPUTER, 0)
+        .map_err(|error| {
+        windows::core::Error::new(
+            windows::Win32::Foundation::E_FAIL,
+            format!("Enrollment self-test failed: {error}"),
+        )
+    })?;
+
+    let mut pin_bytes = Zeroizing::new(pin.as_bytes().to_vec());
+    let decrypted = scard_core::unlock(
+        enrolled.vault,
+        TEST_SID,
+        TEST_USER,
+        TEST_COMPUTER,
+        None,
+        &mut pin_bytes,
+    )
+    .map_err(|error| {
+        windows::core::Error::new(
+            windows::Win32::Foundation::E_FAIL,
+            format!("Unlock self-test failed: {error}"),
+        )
+    })?;
+
+    if decrypted.as_str() != TEST_PASSWORD {
+        return Err(windows::core::Error::new(
+            windows::Win32::Foundation::E_FAIL,
+            "Card self-test decrypted an unexpected password.",
+        ));
+    }
+
+    println!("Card self-test succeeded.");
+    println!(
+        "Fingerprint: {}",
+        hex::encode(enrolled.card_pub_fingerprint)
+    );
+    println!(
+        "Card: {}",
+        enrolled.card_name.as_deref().unwrap_or("(unknown)")
+    );
     Ok(())
 }
 

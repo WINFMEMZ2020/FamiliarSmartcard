@@ -177,9 +177,13 @@ impl<'a> PivSession<'a> {
     /// then falls back to the standard PIV public-key template (`7F49`).
     pub fn read_ec_public_key(&self, slot: u8) -> Result<Vec<u8>> {
         if let Some(metadata) = self.get_metadata(slot)? {
-            if let Some(public_key_object) = find_tlv_recursive(&metadata.raw, 0x06, 0) {
-                if let Some(point) = find_tlv_recursive(public_key_object, 0x86, 0) {
-                    return Ok(point.to_vec());
+            // Yubico metadata uses 0x04 for the public-key object; some
+            // implementations use 0x06. Accept both, then find the SEC1 point.
+            for wrapper in [0x04u32, 0x06u32] {
+                if let Some(public_key_object) = find_tlv_recursive(&metadata.raw, wrapper, 0) {
+                    if let Some(point) = find_tlv_recursive(public_key_object, 0x86, 0) {
+                        return Ok(point.to_vec());
+                    }
                 }
             }
         }
@@ -393,6 +397,18 @@ mod tests {
 
         let found = find_tlv_recursive(&outer, 0x86, 0).unwrap();
         assert_eq!(found, &point[..]);
+    }
+
+    #[test]
+    fn metadata_public_key_uses_tag_04() {
+        let metadata = hex::decode(
+            "0101110202030103010104438641049b8dbc6dcb92018da4fd1a48668dcc12ce4af6a227469adb0ce702d17b16e9fd4224f0fe5a88570b8a92ecb201fdab60fc539aa977b767cc07903f07a4d63706",
+        )
+        .unwrap();
+        let public_key_object = find_tlv_recursive(&metadata, 0x04, 0).unwrap();
+        let point = find_tlv_recursive(public_key_object, 0x86, 0).unwrap();
+        assert_eq!(point.len(), 65);
+        assert_eq!(point[0], 0x04);
     }
 
     #[test]

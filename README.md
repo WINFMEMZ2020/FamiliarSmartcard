@@ -28,6 +28,12 @@ Headless probe (useful over RDP or in the test VM):
 cargo run -p enroll-gui -- --probe
 ```
 
+Card-only crypto self-test (no registry write, no Windows password change):
+
+```powershell
+cargo run -p enroll-gui -- --card-selftest <PIV-PIN>
+```
+
 Release Credential Provider:
 
 ```powershell
@@ -43,15 +49,17 @@ The DLL is `target\release\cred_provider.dll`.
 3. The target account must be a local Workgroup account.
 4. The GUI must be run elevated to write `HKLM`.
 
-The card is currently not provisioned until `Slot 0x9D: key present` appears in
-the GUI probe output.
+Provisioning is complete when `Slot 0x9D: key present` appears in the probe
+output. The development card has a 9D P-256 key with PIN policy `ALWAYS` and
+touch policy `NEVER`; it still uses the **default development PIN**. Change the
+PIN/PUK/management key before any real use.
 
 ## Current limitations
 
 - The GUI binds the **existing** Windows password; random-password rotation and
   the two-phase recovery-sheet flow are not wired yet.
-- PIV 9D provisioning (management-key auth + on-card P-256 with PIN policy
-  ALWAYS + attestation pinning) must be done before binding.
+- The development card uses the default PIN. Production provisioning must also
+  rotate PIN/PUK/management key, remove `--protect`, and pin `f9` attestation.
 - The Credential Provider currently uses the synchronous PC/SC path in
   `GetSerialization`; the isolated helper/timeout process is designed in the
   plan but not implemented yet.
