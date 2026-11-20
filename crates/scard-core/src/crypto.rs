@@ -68,10 +68,10 @@ pub fn aes_gcm_encrypt(
         .map_err(|_| AuthError::Crypto("invalid AES-256-GCM key length".into()))?;
     let mut buffer = plaintext.to_vec();
     let tag = cipher
-        .encrypt_in_place_detached(Nonce::from_slice(nonce), aad, &mut buffer)
+        .encrypt_in_place_detached(&Nonce::from(*nonce), aad, &mut buffer)
         .map_err(|_| AuthError::Crypto("AES-256-GCM encryption failed".into()))?;
     let mut tag_bytes = [0u8; TAG_LEN];
-    tag_bytes.copy_from_slice(tag.as_slice());
+    tag_bytes.copy_from_slice(&tag[..]);
     Ok((buffer, tag_bytes))
 }
 
@@ -88,10 +88,10 @@ pub fn aes_gcm_decrypt(
     let mut buffer = ciphertext.to_vec();
     cipher
         .decrypt_in_place_detached(
-            Nonce::from_slice(nonce),
+            &Nonce::from(*nonce),
             aad,
             &mut buffer,
-            Tag::from_slice(tag),
+            &Tag::from(*tag),
         )
         .map_err(|_| AuthError::Crypto("AES-256-GCM authentication failed".into()))?;
     Ok(Zeroizing::new(buffer))
@@ -112,7 +112,7 @@ pub fn p256_shared_secret(secret: EphemeralSecret, peer: &PublicKey) -> Zeroizin
     let shared = secret.diffie_hellman(peer);
     let raw = shared.raw_secret_bytes();
     let mut out = [0u8; 32];
-    out.copy_from_slice(raw.as_slice());
+    out.copy_from_slice(&raw[..]);
     Zeroizing::new(out)
 }
 
