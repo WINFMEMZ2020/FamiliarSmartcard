@@ -34,14 +34,10 @@ Card-only crypto self-test (no registry write, no Windows password change):
 cargo run -p enroll-gui -- --card-selftest <PIV-PIN>
 ```
 
-Enrollment GUI (must be elevated so it can write HKLM):
-
-```powershell
-Start-Process .\target\debug\familiar-enroll.exe -Verb RunAs
-```
-
-Enter the PIV PIN and the current Windows password, click `Bind current account`,
-then `Self-test`.
+Friendly enrollment GUI: double-click `familiar-enroll.exe` (the `dist` package
+is recommended). It requests UAC automatically, probes the RS-Key on startup,
+and the primary `Set up this account` button performs bind + self-test + provider
+registration in one flow. Enter the PIV PIN and the current Windows password.
 
 Release Credential Provider:
 

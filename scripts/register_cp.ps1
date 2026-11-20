@@ -1,14 +1,25 @@
 #Requires -RunAsAdministrator
+param(
+    [string]$DllPath = ''
+)
+
 $ErrorActionPreference = 'Stop'
 
 $clsid = '{6E2B7F4A-9C1D-4E8B-9A7F-3D5C1E2B4A60}'
 $installDir = Join-Path $env:ProgramFiles 'FamiliarSmartcard'
-$dllSource = Join-Path $PSScriptRoot '..\target\release\cred_provider.dll'
 $dllDest = Join-Path $installDir 'familiar_cred_provider.dll'
 
-if (-not (Test-Path $dllSource)) {
-    throw "Build the DLL first: cargo build --release -p cred-provider"
+if ([string]::IsNullOrWhiteSpace($DllPath)) {
+    $candidates = @(
+        (Join-Path $PSScriptRoot 'cred_provider.dll'),
+        (Join-Path $PSScriptRoot '..\target\release\cred_provider.dll')
+    )
+    $DllPath = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 }
+if ([string]::IsNullOrWhiteSpace($DllPath) -or -not (Test-Path $DllPath)) {
+    throw "cred_provider.dll not found. Pass -DllPath or build it with: cargo build --release -p cred-provider"
+}
+$dllSource = (Resolve-Path $DllPath).Path
 
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 Copy-Item -Force $dllSource $dllDest
