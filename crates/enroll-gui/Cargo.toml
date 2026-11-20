@@ -1,0 +1,16 @@
+[package]
+name = "enroll-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "FamiliarSmartcard enrollment and diagnostics GUI"
+
+[[bin]]
+name = "familiar-enroll"
+path = "src/main.rs"
+
+[dependencies]
+windows.workspace = true
+zeroize.workspace = true
+scard-core = { path = "../scard-core" }

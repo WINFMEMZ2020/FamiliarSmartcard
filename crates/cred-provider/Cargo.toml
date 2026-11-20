@@ -1,0 +1,15 @@
+[package]
+name = "cred-provider"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "FamiliarSmartcard Windows Credential Provider"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+windows.workspace = true
+zeroize.workspace = true
+scard-core = { path = "../scard-core" }
