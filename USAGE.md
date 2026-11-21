@@ -61,8 +61,9 @@ rescue_delete_cp.reg         # WinRE / 安全模式救援注册表文件
    - **`Current Windows password`**：输入目标本地账户**当前的** Windows 密码。
    - **`Card Key & Touch Policy`（卡片密钥与触摸策略）**：
      - **`Keep existing 0x9D card key`**：保持卡内现有 `0x9D` 密钥不变（当卡内已有密钥时默认选中，防止误覆盖多机共用的卡片）。
-     - **`New 0x9D: Touch = ALWAYS (physical touch)`**：在卡内重新生成 `0x9D` 密钥并要求每次登录**输入 PIN + 手指物理触碰金属触点**（全新空卡时默认自动选中；安全性最高，防后台恶意进程或远程静默调用）。
-     - **`New 0x9D: Touch = NEVER (PIN only)`**：在卡内重新生成 `0x9D` 密钥且**仅要求输入 PIN 免触摸**（适合钥匙插在够不到的机箱后置接口，或不带电容触摸传感器的传统智能卡）。
+     - **`New 0x9D: Touch = CACHED (1 touch — Recommended)`**：推荐单次触摸模式！每次登录输入 PIN 后**只需按 1 次安全密钥按钮**，解封完成后程序会在几十毫秒内立即执行 `SCARD_RESET_CARD` 硬件复位清零芯片触摸缓存（全新空卡时默认自动选中）。
+     - **`New 0x9D: Touch = ALWAYS (strict 2 touches)`**：严格双次触摸模式（第 1 次防重放挑战 + 第 2 次静态解封各需按 1 次按钮）。注：在 Windows 锁屏登录时，两种触摸模式都会弹出**置顶实时引导窗口**，动态显示按键进度（`1/1` 或 `Step 1 of 2 -> Step 2 of 2`）并提供 **`Cancel`（或按 `Esc`）随时中断返回**，不会卡在系统 `...` 转圈界面。
+     - **`New 0x9D: Touch = NEVER (PIN only, no touch)`**：在卡内重新生成 `0x9D` 密钥且**仅要求输入 PIN 免触摸**（适合钥匙插在够不到的机箱后置接口，或不带电容触摸传感器的传统智能卡）。
      - **`Also generate Slot 0x9E anti-phishing key (PIN=NEVER)`**（生钥时默认勾选）：一并在 `0x9E` 槽位生成硬件防钓鱼密钥，使每次输 PIN / PUK 前自动执行芯片级动态挑战。
      - **`0x9B Mgmt Key` / `Rotate 0x9B to`**：若卡片管理密钥仍为出厂默认（`010203...08`）或使用 PIN 保护的管理密钥，留空即可；若需使用或轮换为自定义 32/48/64 位十六进制管理密钥，可直接填入对应输入框（轮换后的新管理密钥请务必离线妥善保存）。
 3. 点击主按钮 **`Set up & rotate password (Recommended)`**：

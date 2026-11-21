@@ -8,14 +8,15 @@
 #![forbid(unsafe_code)]
 
 use crate::crypto::{
-    aes_gcm_decrypt, constant_time_eq, hkdf_sha256, is_all_zero, p256_generate_ephemeral,
-    p256_public_from_sec1, p256_public_to_sec1, p256_shared_secret, sha256,
+    aes_gcm_decrypt, constant_time_eq, hkdf_sha256, is_all_zero, p256_blind_enrollment_point,
+    p256_generate_ephemeral, p256_public_from_sec1, p256_public_to_sec1, p256_shared_secret,
+    p256_unblind_ecdh_candidates, sha256,
 };
 use crate::error::{AuthError, Result};
 use crate::pcsc::{ScardCard, ScardContext};
 use crate::piv::{
     validate_slot_9d_policy, ApduTransport, PivSession, ALG_ECC_P256, KEY_REF_PIN,
-    SLOT_KEY_MANAGEMENT,
+    SLOT_KEY_MANAGEMENT, TOUCH_POLICY_ALWAYS, TOUCH_POLICY_NEVER,
 };
 use crate::vault::{aad_password, aad_wrap, unpad_password, AadPasswordParams, VaultBlob};
 use zeroize::Zeroizing;
@@ -29,6 +30,7 @@ struct CardState<T: ApduTransport> {
     card: T,
     _context: Option<ScardContext>,
     card_pub_sec1: Vec<u8>,
+    touch_policy: u8,
 }
 
 pub struct AuthPipeline;
@@ -86,10 +88,12 @@ impl VaultLoaded {
         let session = PivSession::new(&transport);
         session.select()?;
 
+        let mut touch_policy = TOUCH_POLICY_NEVER;
         if self.vault.slot == SLOT_KEY_MANAGEMENT {
             if let Some(meta) = session.get_metadata(self.vault.slot)? {
                 let policy = meta.parse();
                 validate_slot_9d_policy(&policy)?;
+                touch_policy = policy.touch_policy.unwrap_or(TOUCH_POLICY_NEVER);
             }
         }
 
@@ -107,6 +111,7 @@ impl VaultLoaded {
             card: transport,
             _context: None,
             card_pub_sec1,
+            touch_policy,
         }))
     }
 
@@ -149,12 +154,15 @@ impl VaultLoaded {
                 continue;
             }
 
-            let check_result: Result<Vec<u8>> = (|| {
+            let check_result: Result<(Vec<u8>, u8)> = (|| {
                 let session = PivSession::new(&card);
                 session.select()?;
+                let mut tp = TOUCH_POLICY_NEVER;
                 if self.vault.slot == SLOT_KEY_MANAGEMENT {
                     if let Some(meta) = session.get_metadata(self.vault.slot)? {
-                        validate_slot_9d_policy(&meta.parse())?;
+                        let parsed = meta.parse();
+                        validate_slot_9d_policy(&parsed)?;
+                        tp = parsed.touch_policy.unwrap_or(TOUCH_POLICY_NEVER);
                     }
                 }
                 let pub_sec1 = session.read_ec_public_key(self.vault.slot)?;
@@ -162,11 +170,11 @@ impl VaultLoaded {
                 if !constant_time_eq(&sha256(&pub_sec1), &self.vault.card_pub_fingerprint) {
                     return Err(AuthError::WrongCard);
                 }
-                Ok(pub_sec1)
+                Ok((pub_sec1, tp))
             })();
 
-            let card_pub_sec1 = match check_result {
-                Ok(pub_sec1) => pub_sec1,
+            let (card_pub_sec1, touch_policy) = match check_result {
+                Ok(pair) => pair,
                 Err(error) => {
                     last_error = Some(error);
                     continue;
@@ -185,6 +193,7 @@ impl VaultLoaded {
                 card,
                 _context: Some(context),
                 card_pub_sec1,
+                touch_policy,
             }));
         }
 
@@ -195,6 +204,12 @@ impl VaultLoaded {
 impl<T: ApduTransport> CardConnected<T> {
     pub fn card_fingerprint(&self) -> &[u8; 32] {
         &self.0.vault.card_pub_fingerprint
+    }
+
+    /// Return the hardware `TouchPolicy` (`NEVER=0x01`, `ALWAYS=0x02`, `CACHED=0x03`)
+    /// reported directly by the connected card's `00 F7` slot metadata.
+    pub fn detected_touch_policy(&self) -> u8 {
+        self.0.touch_policy
     }
 
     /// Read-only query of remaining PIV PIN attempts inside the active PC/SC transaction.
@@ -253,6 +268,70 @@ impl<T: ApduTransport> PinVerified<T> {
             }
         }
         Ok(FreshnessProven(state))
+    }
+
+    /// Single-APDU Blinded P-256 ECDH key unwrap (`B = P_enroll + b * G`).
+    ///
+    /// Proves dynamic anti-replay freshness AND unwraps `DEK` in **one single**
+    /// `GENERAL AUTHENTICATE` (`00 87`) APDU, guaranteeing **1 physical button press**
+    /// on all PIV hardware security keys (including firmware where `TOUCH_POLICY_CACHED`
+    /// still prompts on every `00 87` or resets touch state on `VERIFY PIN`).
+    pub fn unwrap_dek_blinded_single_touch(self) -> Result<KeyUnwrapped> {
+        let state = self.0;
+        let dek = {
+            let session = PivSession::new(&state.card);
+            let (blind_state, blinded_pub_sec1) =
+                p256_blind_enrollment_point(&state.vault.eph_pub_enroll, &state.card_pub_sec1)?;
+
+            let card_x = Zeroizing::new(session.general_authenticate_ecdh(
+                state.vault.slot,
+                ALG_ECC_P256,
+                &blinded_pub_sec1,
+            )?);
+
+            let candidates = p256_unblind_ecdh_candidates(blind_state, &card_x)?;
+            let aad = aad_wrap(
+                state.vault.version,
+                state.vault.app,
+                state.vault.slot,
+                state.vault.alg,
+                &state.vault.card_pub_fingerprint,
+                &state.sid,
+            );
+
+            let mut matched_dek: Option<Zeroizing<[u8; 32]>> = None;
+            for cand_x in &candidates {
+                let kek = hkdf_sha256(
+                    cand_x.as_ref(),
+                    &state.vault.salt,
+                    b"FamiliarSmartcard/v1/wrap",
+                )?;
+                if let Ok(dek_bytes) = aes_gcm_decrypt(
+                    &kek[..],
+                    &state.vault.wrap_nonce,
+                    &state.vault.wrapped_dek,
+                    &state.vault.wrap_tag,
+                    &aad,
+                ) {
+                    if dek_bytes.len() == 32 {
+                        let mut d = Zeroizing::new([0u8; 32]);
+                        d.copy_from_slice(&dek_bytes);
+                        matched_dek = Some(d);
+                    }
+                }
+            }
+
+            matched_dek.ok_or(AuthError::WrongCard)?
+        };
+
+        // Dropping `state.card` here triggers `SCARD_RESET_CARD` before `_context` drops.
+        Ok(KeyUnwrapped {
+            vault: state.vault,
+            sid: state.sid,
+            username: state.username,
+            computer: state.computer,
+            dek,
+        })
     }
 }
 
@@ -375,14 +454,18 @@ pub fn unlock(
     reader: Option<&str>,
     pin: &mut Zeroizing<Vec<u8>>,
 ) -> Result<Zeroizing<String>> {
-    let credential = AuthPipeline::start(vault, sid, username, computer)?
-        .connect_card(reader)?
-        .verify_pin(pin)?
-        .prove_freshness()?
-        .verify_pin_for_unwrap(pin)?
-        .unwrap_dek()?
-        .decrypt_credential()?;
-    Ok(credential.into_password())
+    let connected = AuthPipeline::start(vault, sid, username, computer)?.connect_card(reader)?;
+    let strict_two_touches = connected.detected_touch_policy() == TOUCH_POLICY_ALWAYS;
+    let verified = connected.verify_pin(pin)?;
+    let unwrapped = if strict_two_touches {
+        verified
+            .prove_freshness()?
+            .verify_pin_for_unwrap(pin)?
+            .unwrap_dek()?
+    } else {
+        verified.unwrap_dek_blinded_single_touch()?
+    };
+    Ok(unwrapped.decrypt_credential()?.into_password())
 }
 
 /// Convenience one-shot pipeline over a custom `ApduTransport` (for mock/replay tests).
@@ -394,14 +477,19 @@ pub fn unlock_with_transport<T: ApduTransport>(
     transport: T,
     pin: &Zeroizing<Vec<u8>>,
 ) -> Result<Zeroizing<String>> {
-    let credential = AuthPipeline::start(vault, sid, username, computer)?
-        .connect_with_transport(transport)?
-        .verify_pin(pin)?
-        .prove_freshness()?
-        .verify_pin_for_unwrap(pin)?
-        .unwrap_dek()?
-        .decrypt_credential()?;
-    Ok(credential.into_password())
+    let connected =
+        AuthPipeline::start(vault, sid, username, computer)?.connect_with_transport(transport)?;
+    let strict_two_touches = connected.detected_touch_policy() == TOUCH_POLICY_ALWAYS;
+    let verified = connected.verify_pin(pin)?;
+    let unwrapped = if strict_two_touches {
+        verified
+            .prove_freshness()?
+            .verify_pin_for_unwrap(pin)?
+            .unwrap_dek()?
+    } else {
+        verified.unwrap_dek_blinded_single_touch()?
+    };
+    Ok(unwrapped.decrypt_credential()?.into_password())
 }
 
 impl<T: ApduTransport + ?Sized> ApduTransport for &T {
@@ -436,9 +524,11 @@ mod tests {
         remaining_puk_retries: RefCell<u8>,
         pin_verified_once: RefCell<bool>,
         verify_calls: RefCell<usize>,
+        ecdh_9d_calls: RefCell<usize>,
         reset_retry_calls: RefCell<usize>,
         replay_override: Option<[u8; 32]>,
         pin_policy: u8,
+        touch_policy: u8,
     }
 
     impl SimulatedPivCard {
@@ -467,9 +557,11 @@ mod tests {
                 remaining_puk_retries: RefCell::new(3),
                 pin_verified_once: RefCell::new(false),
                 verify_calls: RefCell::new(0),
+                ecdh_9d_calls: RefCell::new(0),
                 reset_retry_calls: RefCell::new(0),
                 replay_override,
                 pin_policy,
+                touch_policy: TOUCH_POLICY_NEVER,
             }
         }
     }
@@ -511,7 +603,7 @@ mod tests {
                     }
                     let mut meta = Vec::new();
                     meta.extend_from_slice(&tlv(0x01, &[ALG_ECC_P256])?);
-                    meta.extend_from_slice(&tlv(0x02, &[self.pin_policy, TOUCH_POLICY_NEVER])?);
+                    meta.extend_from_slice(&tlv(0x02, &[self.pin_policy, self.touch_policy])?);
                     meta.extend_from_slice(&tlv(0x03, &[ORIGIN_GENERATED])?);
                     let pk_inner = tlv(0x86, &self.advertised_public_sec1)?;
                     meta.extend_from_slice(&tlv(0x04, &pk_inner)?);
@@ -584,6 +676,7 @@ mod tests {
                         if !*self.pin_verified_once.borrow() {
                             return Ok(vec![0x69, 0x82]);
                         }
+                        *self.ecdh_9d_calls.borrow_mut() += 1;
                         // Consume ALWAYS PIN immediately
                         *self.pin_verified_once.borrow_mut() = false;
                         &self.secret_key
@@ -668,15 +761,45 @@ mod tests {
     }
 
     #[test]
-    fn full_typestate_unlock_succeeds_and_consumes_pin_twice() {
-        let card = SimulatedPivCard::new(b"123456", None, PIN_POLICY_ALWAYS);
-        let vault = build_test_vault(&card.advertised_public_sec1, "2345-6789-ABCD-EFGH");
+    fn full_typestate_unlock_uses_one_touch_for_cached_and_two_for_strict_always() {
+        // 1. TOUCH_POLICY_CACHED (single-touch mode): MUST issue ONLY 1 `00 20` and 1 `00 87`!
+        let mut cached_card = SimulatedPivCard::new(b"123456", None, PIN_POLICY_ALWAYS);
+        cached_card.touch_policy = crate::piv::TOUCH_POLICY_CACHED;
+        let vault = build_test_vault(&cached_card.advertised_public_sec1, "2345-6789-ABCD-EFGH");
         let pin = Zeroizing::new(b"123456".to_vec());
 
-        let pw = unlock_with_transport(vault, "S-1-5-21-100", "alice", "WORKSTATION", &card, &pin)
-            .unwrap();
+        let pw = unlock_with_transport(
+            vault.clone(),
+            "S-1-5-21-100",
+            "alice",
+            "WORKSTATION",
+            &cached_card,
+            &pin,
+        )
+        .unwrap();
         assert_eq!(pw.as_str(), "2345-6789-ABCD-EFGH");
-        assert_eq!(*card.verify_calls.borrow(), 2);
+        assert_eq!(*cached_card.verify_calls.borrow(), 1);
+        assert_eq!(
+            *cached_card.ecdh_9d_calls.borrow(),
+            1,
+            "TOUCH_POLICY_CACHED must require only 1 hardware ECDH / 1 button press!"
+        );
+
+        // 2. TOUCH_POLICY_ALWAYS (strict 2-touch mode): issues 2 `00 20` and 2 `00 87`!
+        let mut strict_card = SimulatedPivCard::new(b"123456", None, PIN_POLICY_ALWAYS);
+        strict_card.touch_policy = TOUCH_POLICY_ALWAYS;
+        let pw2 = unlock_with_transport(
+            vault,
+            "S-1-5-21-100",
+            "alice",
+            "WORKSTATION",
+            &strict_card,
+            &pin,
+        )
+        .unwrap();
+        assert_eq!(pw2.as_str(), "2345-6789-ABCD-EFGH");
+        assert_eq!(*strict_card.verify_calls.borrow(), 2);
+        assert_eq!(*strict_card.ecdh_9d_calls.borrow(), 2);
     }
 
     #[test]

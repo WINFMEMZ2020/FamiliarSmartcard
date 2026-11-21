@@ -68,9 +68,10 @@ const ID_REGISTER: usize = 1006;
 const ID_CLEAR: usize = 1007;
 const ID_MANAGE_PUK: usize = 1008;
 const ID_RADIO_KEEP_KEY: usize = 1009;
-const ID_RADIO_TOUCH_ALWAYS: usize = 1010;
-const ID_RADIO_TOUCH_NEVER: usize = 1011;
-const ID_CHK_PROVISION_9E: usize = 1012;
+const ID_RADIO_TOUCH_CACHED: usize = 1010;
+const ID_RADIO_TOUCH_ALWAYS: usize = 1011;
+const ID_RADIO_TOUCH_NEVER: usize = 1012;
+const ID_CHK_PROVISION_9E: usize = 1013;
 
 const WM_WORKER_RESULT: u32 = WM_APP + 10;
 const WM_WORKER_STATUS: u32 = WM_APP + 11;
@@ -92,6 +93,7 @@ struct AppState {
     pin: HWND,
     password: HWND,
     radio_keep: HWND,
+    radio_touch_cached: HWND,
     radio_touch_always: HWND,
     radio_touch_never: HWND,
     chk_9e: HWND,
@@ -246,8 +248,8 @@ fn print_cli_help() {
          Usage:\n\
          \x20 familiar-enroll.exe                                Launch elevated Win32 setup GUI\n\
          \x20 familiar-enroll.exe --probe                        Read-only reader, PIN/PUK, 0x9B/0x9D policy & 0xF9 attestation probe\n\
-         \x20 familiar-enroll.exe --provision-card <always|never> [--no-9e] [--pin <PIN>] [--mgmt-key <HEX>] [--new-mgmt-key <HEX>]\n\
-         \x20                                                    Generate on-card P-256 0x9D key with Touch ALWAYS or NEVER (+ 0x9E)\n\
+         \x20 familiar-enroll.exe --provision-card <cached|always|never> [--no-9e] [--pin <PIN>] [--mgmt-key <HEX>] [--new-mgmt-key <HEX>]\n\
+         \x20                                                    Generate on-card P-256 0x9D key (1-touch CACHED, 2-touch ALWAYS, or NEVER)\n\
          \x20 familiar-enroll.exe --card-selftest <PIN>          Stateless card ECDH/AES-GCM self-test (no registry writes)\n\
          \x20 familiar-enroll.exe --unblock-pin <PUK> <NEW-PIN>  Unblock PIV PIN via PUK (00 2C 00 80) and reset retries to 3\n\
          \x20 familiar-enroll.exe --change-puk <CUR> <NEW>       Change card PUK via 00 24 00 81 (PIV default: 12345678)\n\
@@ -486,18 +488,22 @@ fn change_puk_cli(cur_puk_arg: &str, new_puk_arg: &str) -> windows::core::Result
 fn provision_card_cli(rest: &[String]) -> windows::core::Result<()> {
     let Some(touch_str) = rest.first().map(String::as_str) else {
         eprintln!(
-            "Usage: familiar-enroll.exe --provision-card <always|never> [--no-9e] [--pin <PIN>] [--mgmt-key <HEX>] [--new-mgmt-key <HEX>]\n"
+            "Usage: familiar-enroll.exe --provision-card <cached|always|never> [--no-9e] [--pin <PIN>] [--mgmt-key <HEX>] [--new-mgmt-key <HEX>]\n"
         );
         return Err(windows::core::Error::from_hresult(
             windows::Win32::Foundation::E_INVALIDARG,
         ));
     };
-    let touch_policy_9d = if touch_str.eq_ignore_ascii_case("always") {
+    let touch_policy_9d = if touch_str.eq_ignore_ascii_case("cached") {
+        TOUCH_POLICY_CACHED
+    } else if touch_str.eq_ignore_ascii_case("always") {
         TOUCH_POLICY_ALWAYS
     } else if touch_str.eq_ignore_ascii_case("never") {
         TOUCH_POLICY_NEVER
     } else {
-        eprintln!("Invalid touch policy '{touch_str}': expected 'always' or 'never'.\n");
+        eprintln!(
+            "Invalid touch policy '{touch_str}': expected 'cached' (1 touch), 'always' (2 touches), or 'never'.\n"
+        );
         return Err(windows::core::Error::from_hresult(
             windows::Win32::Foundation::E_INVALIDARG,
         ));
@@ -622,7 +628,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_COMMAND => {
                 let id = wparam.0 & 0xFFFF;
                 match id {
-                    ID_RADIO_KEEP_KEY | ID_RADIO_TOUCH_ALWAYS | ID_RADIO_TOUCH_NEVER => {
+                    ID_RADIO_KEEP_KEY
+                    | ID_RADIO_TOUCH_CACHED
+                    | ID_RADIO_TOUCH_ALWAYS
+                    | ID_RADIO_TOUCH_NEVER => {
                         if let Some(st) = state_mut(hwnd) {
                             st.user_touched_provision_mode = true;
                         }
@@ -784,7 +793,7 @@ unsafe fn create_controls(hwnd: HWND) {
             "Keep existing 0x9D card key",
             20,
             178,
-            235,
+            260,
             22,
             STYLE_AUTORADIO | STYLE_GROUP,
             ID_RADIO_KEEP_KEY as isize,
@@ -797,12 +806,24 @@ unsafe fn create_controls(hwnd: HWND) {
             Some(LPARAM(0)),
         );
 
+        let radio_touch_cached = create_check_control(
+            hwnd,
+            "New 0x9D: Touch = CACHED (1 touch — Recommended)",
+            305,
+            178,
+            430,
+            22,
+            STYLE_AUTORADIO,
+            ID_RADIO_TOUCH_CACHED as isize,
+            font,
+        );
+
         let radio_touch_always = create_check_control(
             hwnd,
-            "New 0x9D: Touch = ALWAYS (physical touch)",
-            262,
-            178,
-            318,
+            "New 0x9D: Touch = ALWAYS (strict 2 touches)",
+            20,
+            202,
+            280,
             22,
             STYLE_AUTORADIO,
             ID_RADIO_TOUCH_ALWAYS as isize,
@@ -811,10 +832,10 @@ unsafe fn create_controls(hwnd: HWND) {
 
         let radio_touch_never = create_check_control(
             hwnd,
-            "New 0x9D: Touch = NEVER (PIN only)",
-            590,
-            178,
-            290,
+            "New 0x9D: Touch = NEVER (PIN only, no touch)",
+            305,
+            202,
+            390,
             22,
             STYLE_AUTORADIO,
             ID_RADIO_TOUCH_NEVER as isize,
@@ -825,7 +846,7 @@ unsafe fn create_controls(hwnd: HWND) {
             hwnd,
             "Also generate Slot 0x9E anti-phishing key (PIN=NEVER, Touch=NEVER)",
             20,
-            204,
+            228,
             510,
             22,
             STYLE_AUTOCHECKBOX | STYLE_GROUP,
@@ -844,13 +865,13 @@ unsafe fn create_controls(hwnd: HWND) {
             w!("STATIC"),
             "0x9B Mgmt Key (blank=default)",
             20,
-            234,
+            256,
             215,
             22,
             0,
         );
         set_font(mgmt_cur_lbl, font);
-        let mgmt_cur = create_control(hwnd, w!("EDIT"), "", 240, 232, 195, 24, 0);
+        let mgmt_cur = create_control(hwnd, w!("EDIT"), "", 240, 254, 195, 24, 0);
         let _ = SendMessageW(
             mgmt_cur,
             EM_SETPASSWORDCHAR,
@@ -864,13 +885,13 @@ unsafe fn create_controls(hwnd: HWND) {
             w!("STATIC"),
             "Rotate 0x9B to (opt. hex)",
             450,
-            234,
+            256,
             185,
             22,
             0,
         );
         set_font(mgmt_new_lbl, font);
-        let mgmt_new = create_control(hwnd, w!("EDIT"), "", 640, 232, 240, 24, 0);
+        let mgmt_new = create_control(hwnd, w!("EDIT"), "", 640, 254, 240, 24, 0);
         set_font(mgmt_new, font);
 
         // Row 1: Primary enrollment vs Advanced/Rescue re-bind
@@ -879,7 +900,7 @@ unsafe fn create_controls(hwnd: HWND) {
             w!("BUTTON"),
             "Set up & rotate password (Recommended)",
             20,
-            268,
+            288,
             290,
             38,
             ID_SETUP_ROTATE as isize,
@@ -891,7 +912,7 @@ unsafe fn create_controls(hwnd: HWND) {
             w!("BUTTON"),
             "Re-bind current password (Advanced / Rescue)",
             322,
-            268,
+            288,
             305,
             38,
             ID_REBIND_EXISTING as isize,
@@ -904,7 +925,7 @@ unsafe fn create_controls(hwnd: HWND) {
             w!("BUTTON"),
             "Probe card",
             20,
-            314,
+            334,
             105,
             30,
             ID_PROBE as isize,
@@ -916,7 +937,7 @@ unsafe fn create_controls(hwnd: HWND) {
             w!("BUTTON"),
             "Self-test vault",
             133,
-            314,
+            334,
             120,
             30,
             ID_SELFTEST as isize,
@@ -928,7 +949,7 @@ unsafe fn create_controls(hwnd: HWND) {
             w!("BUTTON"),
             "Unblock PIN / PUK...",
             261,
-            314,
+            334,
             165,
             30,
             ID_MANAGE_PUK as isize,
@@ -940,7 +961,7 @@ unsafe fn create_controls(hwnd: HWND) {
             w!("BUTTON"),
             "Re-pin card root",
             434,
-            314,
+            334,
             140,
             30,
             ID_REPIN_ROOT as isize,
@@ -952,7 +973,7 @@ unsafe fn create_controls(hwnd: HWND) {
             w!("BUTTON"),
             "Register provider",
             582,
-            314,
+            334,
             145,
             30,
             ID_REGISTER as isize,
@@ -964,7 +985,7 @@ unsafe fn create_controls(hwnd: HWND) {
             w!("BUTTON"),
             "Clear output",
             735,
-            314,
+            334,
             115,
             30,
             ID_CLEAR as isize,
@@ -983,9 +1004,9 @@ unsafe fn create_controls(hwnd: HWND) {
             PCWSTR::null(),
             out_style,
             20,
-            354,
+            372,
             860,
-            418,
+            400,
             Some(hwnd),
             None,
             None,
@@ -1000,6 +1021,7 @@ unsafe fn create_controls(hwnd: HWND) {
             pin,
             password,
             radio_keep,
+            radio_touch_cached,
             radio_touch_always,
             radio_touch_never,
             chk_9e,
@@ -1071,9 +1093,12 @@ unsafe fn sync_provision_controls_enabled(hwnd: HWND) {
         let Some(st) = state_mut(hwnd) else {
             return;
         };
-        let provisioning =
-            !st.busy && (is_checked(st.radio_touch_always) || is_checked(st.radio_touch_never));
+        let provisioning = !st.busy
+            && (is_checked(st.radio_touch_cached)
+                || is_checked(st.radio_touch_always)
+                || is_checked(st.radio_touch_never));
         let _ = EnableWindow(st.radio_keep, !st.busy);
+        let _ = EnableWindow(st.radio_touch_cached, !st.busy);
         let _ = EnableWindow(st.radio_touch_always, !st.busy);
         let _ = EnableWindow(st.radio_touch_never, !st.busy);
         let _ = EnableWindow(st.chk_9e, provisioning);
@@ -1261,7 +1286,7 @@ unsafe fn spawn_probe_worker(hwnd: HWND, update_output: bool) {
                 } else if let Some(err) = policy_err {
                     format!("PIV smart card detected, but slot 0x9D failed policy check: {err} — select New 0x9D below to re-provision.")
                 } else if any_piv {
-                    "New/empty PIV smart card detected — 'New 0x9D: Touch = ALWAYS' selected for one-step provisioning.".into()
+                    "New/empty PIV smart card detected — 'New 0x9D: Touch = CACHED (1 touch)' selected for one-step setup.".into()
                 } else {
                     "Smart card reader detected, but no PIV card is present.".into()
                 };
@@ -1289,11 +1314,12 @@ unsafe fn spawn_probe_worker(hwnd: HWND, update_output: bool) {
 unsafe fn read_and_confirm_provision_plan(
     hwnd: HWND,
 ) -> Result<Option<ProvisionPlan>, Option<String>> {
-    let (touch_always, touch_never, provision_9e, current_mgmt_hex, new_mgmt_hex) = unsafe {
+    let (touch_cached, touch_always, touch_never, provision_9e, current_mgmt_hex, new_mgmt_hex) = unsafe {
         let Some(st) = state_mut(hwnd) else {
             return Err(None);
         };
         (
+            is_checked(st.radio_touch_cached),
             is_checked(st.radio_touch_always),
             is_checked(st.radio_touch_never),
             is_checked(st.chk_9e),
@@ -1302,11 +1328,13 @@ unsafe fn read_and_confirm_provision_plan(
         )
     };
 
-    if !touch_always && !touch_never {
+    if !touch_cached && !touch_always && !touch_never {
         return Ok(None);
     }
 
-    let touch_policy_9d = if touch_always {
+    let touch_policy_9d = if touch_cached {
+        TOUCH_POLICY_CACHED
+    } else if touch_always {
         TOUCH_POLICY_ALWAYS
     } else {
         TOUCH_POLICY_NEVER
@@ -1337,10 +1365,10 @@ unsafe fn read_and_confirm_provision_plan(
     }
 
     if card_has_9d_key(None) {
-        let policy_name = if touch_policy_9d == TOUCH_POLICY_ALWAYS {
-            "ALWAYS (physical touch required)"
-        } else {
-            "NEVER (PIN only)"
+        let policy_name = match touch_policy_9d {
+            TOUCH_POLICY_CACHED => "CACHED (1 physical touch per sign-in + immediate reset)",
+            TOUCH_POLICY_ALWAYS => "ALWAYS (strict 2 physical touches per sign-in)",
+            _ => "NEVER (PIN only)",
         };
         let warn_msg = format!(
             "Slot 0x9D on the connected smart card ALREADY contains a key.\r\n\r\n\
@@ -1461,10 +1489,15 @@ unsafe fn start_setup_with_rotation(hwnd: HWND) {
             })
             .map_err(|e| format!("Card enrollment failed: {e}"))?;
 
-            if enrolled.touch_policy == TOUCH_POLICY_ALWAYS {
+            if enrolled.touch_policy == TOUCH_POLICY_CACHED {
                 post_status(
                     hwnd_raw,
-                    "ACTION REQUIRED: Touch your blinking security key now (2 touches required for Touch=ALWAYS self-test)...",
+                    "ACTION REQUIRED: Press your blinking security key ONCE now (Touch=CACHED self-test)...",
+                );
+            } else if enrolled.touch_policy == TOUCH_POLICY_ALWAYS {
+                post_status(
+                    hwnd_raw,
+                    "ACTION REQUIRED: Press your blinking security key TWICE now (Touch=ALWAYS self-test)...",
                 );
             }
 
@@ -1819,10 +1852,15 @@ unsafe fn start_rebind_existing_password(hwnd: HWND) {
                 let _ = clear_card_auth_9e_pub(&user.sid);
             }
 
-            if enrolled.touch_policy == TOUCH_POLICY_ALWAYS {
+            if enrolled.touch_policy == TOUCH_POLICY_CACHED {
                 post_status(
                     hwnd_raw,
-                    "ACTION REQUIRED: Touch your blinking security key now (2 touches required for Touch=ALWAYS self-test)...",
+                    "ACTION REQUIRED: Press your blinking security key ONCE now (Touch=CACHED self-test)...",
+                );
+            } else if enrolled.touch_policy == TOUCH_POLICY_ALWAYS {
+                post_status(
+                    hwnd_raw,
+                    "ACTION REQUIRED: Press your blinking security key TWICE now (Touch=ALWAYS self-test)...",
                 );
             }
 
@@ -2072,13 +2110,19 @@ unsafe fn handle_worker_outcome(hwnd: HWND, outcome: WorkerOutcome) {
                                 Some(LPARAM(0)),
                             );
                             let _ = SendMessageW(
+                                st.radio_touch_always,
+                                BM_SETCHECK,
+                                Some(WPARAM(BST_UNCHECKED)),
+                                Some(LPARAM(0)),
+                            );
+                            let _ = SendMessageW(
                                 st.radio_touch_never,
                                 BM_SETCHECK,
                                 Some(WPARAM(BST_UNCHECKED)),
                                 Some(LPARAM(0)),
                             );
                             let _ = SendMessageW(
-                                st.radio_touch_always,
+                                st.radio_touch_cached,
                                 BM_SETCHECK,
                                 Some(WPARAM(BST_CHECKED)),
                                 Some(LPARAM(0)),
@@ -2105,6 +2149,12 @@ unsafe fn handle_worker_outcome(hwnd: HWND, outcome: WorkerOutcome) {
                         scrub_edit_control(st.password);
                         scrub_edit_control(st.mgmt_cur);
                         scrub_edit_control(st.mgmt_new);
+                        let _ = SendMessageW(
+                            st.radio_touch_cached,
+                            BM_SETCHECK,
+                            Some(WPARAM(BST_UNCHECKED)),
+                            Some(LPARAM(0)),
+                        );
                         let _ = SendMessageW(
                             st.radio_touch_always,
                             BM_SETCHECK,
@@ -2194,11 +2244,18 @@ fn self_test_internal(pin: &str, expected_password: &str, user: &UserInfo) -> Re
                 format!("Pre-PIN 0x9E hardware anti-phishing check failed: {error}")
             })?;
     }
+    let strict_two_touches = connected.detected_touch_policy() == TOUCH_POLICY_ALWAYS;
     let decrypted = connected
         .verify_pin(&pin_bytes)
-        .and_then(|v| v.prove_freshness())
-        .and_then(|f| f.verify_pin_for_unwrap(&pin_bytes))
-        .and_then(|u| u.unwrap_dek())
+        .and_then(|v| {
+            if strict_two_touches {
+                v.prove_freshness()
+                    .and_then(|f| f.verify_pin_for_unwrap(&pin_bytes))
+                    .and_then(|u| u.unwrap_dek())
+            } else {
+                v.unwrap_dek_blinded_single_touch()
+            }
+        })
         .and_then(|k| k.decrypt_credential())
         .map(|c| c.into_password())
         .map_err(|error| format!("Unlock failed: {error}"))?;
@@ -2276,10 +2333,12 @@ fn valid_pin(pin: &str) -> bool {
     (6..=8).contains(&pin.len()) && pin.chars().all(|c| c.is_ascii_digit())
 }
 
-fn format_pin_policy(v: Option<u8>) -> &'static str {
+fn format_pin_policy(slot: u8, v: Option<u8>) -> &'static str {
     match v {
-        Some(PIN_POLICY_NEVER) => "NEVER (rejected)",
-        Some(PIN_POLICY_ONCE) => "ONCE (rejected)",
+        Some(PIN_POLICY_NEVER) if slot == 0x9D => "NEVER (rejected for 0x9D)",
+        Some(PIN_POLICY_NEVER) => "NEVER",
+        Some(PIN_POLICY_ONCE) if slot == 0x9D => "ONCE (rejected for 0x9D)",
+        Some(PIN_POLICY_ONCE) => "ONCE",
         Some(PIN_POLICY_ALWAYS) => "ALWAYS",
         Some(_) => "unknown",
         None => "n/a",
@@ -2289,8 +2348,8 @@ fn format_pin_policy(v: Option<u8>) -> &'static str {
 fn format_touch_policy(v: Option<u8>) -> &'static str {
     match v {
         Some(TOUCH_POLICY_NEVER) => "NEVER",
-        Some(TOUCH_POLICY_ALWAYS) => "ALWAYS",
-        Some(TOUCH_POLICY_CACHED) => "CACHED",
+        Some(TOUCH_POLICY_ALWAYS) => "ALWAYS (2 touches)",
+        Some(TOUCH_POLICY_CACHED) => "CACHED (1 touch + reset)",
         Some(_) => "unknown",
         None => "n/a",
     }
@@ -2408,7 +2467,7 @@ fn format_readers(readers: &[scard_core::ReaderProbe], pinned_f9: Option<&str>) 
                     format!(
                         " [alg=0x{:02X}, pin={}, touch={}, origin={}]",
                         pol.algorithm.unwrap_or(0),
-                        format_pin_policy(pol.pin_policy),
+                        format_pin_policy(slot.slot, pol.pin_policy),
                         format_touch_policy(pol.touch_policy),
                         format_origin(pol.origin)
                     )

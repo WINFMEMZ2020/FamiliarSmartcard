@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use zeroize::Zeroizing;
 
 pub const IPC_MAGIC: [u8; 4] = *b"FSH1";
-pub const IPC_VERSION: u8 = 3;
+pub const IPC_VERSION: u8 = 4;
 pub const MAX_IPC_FRAME_LEN: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +91,21 @@ pub enum HelperResponse {
         icon: HelperIcon,
         message: String,
     },
+}
+
+/// Real-time progress notification streamed from `familiar-auth-helper.exe` to
+/// `cred_provider.dll` before the final `HelperResponse` frame arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelperProgress {
+    /// PIN verified; hardware security key is blinking waiting for physical touch `step` of `total`.
+    TouchRequired { step: u8, total: u8 },
+}
+
+/// A frame sent on `familiar-auth-helper.exe` stdout: either an intermediate
+/// `Progress` notification or the terminal `Final` authentication result.
+pub enum HelperStreamFrame {
+    Progress(HelperProgress),
+    Final(HelperResponse),
 }
 
 fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
@@ -299,6 +314,49 @@ impl HelperResponse {
     }
 }
 
+impl HelperStreamFrame {
+    pub fn encode(&self) -> Result<Zeroizing<Vec<u8>>> {
+        match self {
+            Self::Final(resp) => resp.encode(),
+            Self::Progress(HelperProgress::TouchRequired { step, total }) => {
+                let mut payload = Zeroizing::new(Vec::with_capacity(8));
+                payload.extend_from_slice(&IPC_MAGIC);
+                payload.push(IPC_VERSION);
+                payload.push(2u8); // tag 2 = Progress::TouchRequired
+                payload.push(*step);
+                payload.push(*total);
+                Ok(payload)
+            }
+        }
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        if data.len() < 8 || data.len() > MAX_IPC_FRAME_LEN {
+            return Err(AuthError::Ipc("invalid IPC stream frame size".into()));
+        }
+        if data[..4] != IPC_MAGIC || data[4] != IPC_VERSION {
+            return Err(AuthError::Ipc(
+                "bad IPC stream frame magic or version".into(),
+            ));
+        }
+        if data[5] == 2 {
+            if data.len() != 8 {
+                return Err(AuthError::Ipc("invalid TouchRequired frame size".into()));
+            }
+            let step = data[6];
+            let total = data[7];
+            if step == 0 || total == 0 || step > total || total > 4 {
+                return Err(AuthError::Ipc("invalid TouchRequired step/total".into()));
+            }
+            return Ok(Self::Progress(HelperProgress::TouchRequired {
+                step,
+                total,
+            }));
+        }
+        Ok(Self::Final(HelperResponse::decode(data)?))
+    }
+}
+
 /// Write a length-prefixed (`u16_le`) frame to `writer`.
 pub fn write_framed<W: Write>(mut writer: W, frame: &[u8]) -> Result<()> {
     if frame.is_empty() || frame.len() > MAX_IPC_FRAME_LEN {
@@ -419,5 +477,31 @@ mod tests {
             }
             HelperResponse::Success { .. } => panic!("expected failure"),
         }
+
+        // Streaming Progress(TouchRequired) + Final(Success) roundtrip over single pipe buffer
+        let mut stream_wire = Vec::new();
+        let p1 = HelperStreamFrame::Progress(HelperProgress::TouchRequired { step: 1, total: 2 });
+        let p2 = HelperStreamFrame::Progress(HelperProgress::TouchRequired { step: 2, total: 2 });
+        let fin = HelperStreamFrame::Final(resp);
+        write_framed(&mut stream_wire, &p1.encode().unwrap()).unwrap();
+        write_framed(&mut stream_wire, &p2.encode().unwrap()).unwrap();
+        write_framed(&mut stream_wire, &fin.encode().unwrap()).unwrap();
+
+        let mut cursor = Cursor::new(&stream_wire);
+        let f1 = HelperStreamFrame::decode(&read_framed(&mut cursor).unwrap()).unwrap();
+        let f2 = HelperStreamFrame::decode(&read_framed(&mut cursor).unwrap()).unwrap();
+        let f3 = HelperStreamFrame::decode(&read_framed(&mut cursor).unwrap()).unwrap();
+        assert!(matches!(
+            f1,
+            HelperStreamFrame::Progress(HelperProgress::TouchRequired { step: 1, total: 2 })
+        ));
+        assert!(matches!(
+            f2,
+            HelperStreamFrame::Progress(HelperProgress::TouchRequired { step: 2, total: 2 })
+        ));
+        assert!(matches!(
+            f3,
+            HelperStreamFrame::Final(HelperResponse::Success { .. })
+        ));
     }
 }

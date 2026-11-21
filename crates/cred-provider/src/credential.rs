@@ -42,7 +42,8 @@ pub unsafe trait IRawCredentialProviderCredential2: ICredentialProviderCredentia
 use crate::com_guard::guard_com;
 use crate::guids::CLSID_FAMILIAR_SMARTCARD;
 use crate::helper_client::{
-    invoke_auth_helper, DEFAULT_HELPER_TIMEOUT_MS, TOUCH_HELPER_TIMEOUT_MS,
+    invoke_auth_helper_interactive, HelperInvokeOutcome, DEFAULT_HELPER_TIMEOUT_MS,
+    TOUCH_HELPER_TIMEOUT_MS,
 };
 use crate::kerb::{negotiate_package, pack_kerb, protect_password};
 use scard_core::crypto::constant_time_eq;
@@ -684,23 +685,40 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
                 operation,
             };
 
-            let (domain, username, password) = match invoke_auth_helper(&req, timeout_ms) {
-                HelperResponse::Success {
+            let events_for_window = self.lock_inner().events.clone();
+            let helper_outcome = invoke_auth_helper_interactive(&req, timeout_ms, move || {
+                events_for_window.and_then(|ev| unsafe { ev.OnCreatingWindow().ok() })
+            });
+
+            let (domain, username, password) = match helper_outcome {
+                HelperInvokeOutcome::Cancelled => {
+                    // SAFETY: Verified non-null above.
+                    unsafe {
+                        self.fail(
+                            ppsz_status,
+                            pcpsi,
+                            "Sign-in cancelled.".into(),
+                            CPSI_WARNING,
+                        );
+                    }
+                    return Ok(());
+                }
+                HelperInvokeOutcome::Completed(HelperResponse::Success {
                     domain,
                     username,
                     password,
-                } => {
+                }) => {
                     let final_domain = match &self.mode {
                         TargetMode::BoundUser { domain: d, .. } => d.clone(),
                         TargetMode::ExplicitUser => domain,
                     };
                     (final_domain, username, password)
                 }
-                HelperResponse::Failure {
+                HelperInvokeOutcome::Completed(HelperResponse::Failure {
                     reason,
                     icon,
                     message,
-                } => {
+                }) => {
                     let cp_icon = match icon {
                         HelperIcon::None => CPSI_NONE,
                         HelperIcon::Warning => CPSI_WARNING,

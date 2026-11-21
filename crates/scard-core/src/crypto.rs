@@ -200,6 +200,90 @@ pub fn p256_public_to_sec1(public: &PublicKey) -> Vec<u8> {
     public.to_encoded_point(false).as_bytes().to_vec()
 }
 
+/// Ephemeral scalar blinding state for single-APDU anti-replay ECDH unwrap.
+pub struct P256BlindState {
+    scalar: Zeroizing<p256::NonZeroScalar>,
+    card_pub_proj: p256::ProjectivePoint,
+}
+
+/// Blind `eph_pub_enroll_sec1` (`P_enroll`) with a fresh 256-bit random scalar `b`:
+/// `B = P_enroll + b * G`.
+///
+/// Security properties:
+/// - `B` is uniformly distributed over `P-256` on every login, preventing static
+///   replay proxies AND hiding `P_enroll` from PC/SC / USB bus observers.
+/// - Requires only **one** `GENERAL AUTHENTICATE` (`00 87`) APDU on `Slot 0x9D`,
+///   guaranteeing **1 physical button press** even on hardware security keys whose
+///   firmware requires a button press before every `00 87` command.
+pub fn p256_blind_enrollment_point(
+    eph_pub_enroll_sec1: &[u8],
+    card_pub_sec1: &[u8],
+) -> Result<(P256BlindState, Vec<u8>)> {
+    let p_enroll = p256_public_from_sec1(eph_pub_enroll_sec1)?.to_projective();
+    let card_pub_proj = p256_public_from_sec1(card_pub_sec1)?.to_projective();
+
+    loop {
+        let b = Zeroizing::new(p256::NonZeroScalar::random(&mut OsRng));
+        let blinded_proj = p_enroll + (p256::ProjectivePoint::GENERATOR * **b);
+        let blinded_aff = p256::AffinePoint::from(blinded_proj);
+        if let Ok(blinded_pk) = PublicKey::from_affine(blinded_aff) {
+            let sec1 = p256_public_to_sec1(&blinded_pk);
+            return Ok((
+                P256BlindState {
+                    scalar: b,
+                    card_pub_proj,
+                },
+                sec1,
+            ));
+        }
+    }
+}
+
+/// Unblind the 32-byte X-coordinate `card_ecdh_x = x(d_C * B)` returned by the card
+/// into the two candidate static shared-secret X-coordinates `x(±R - b * Q_card)`.
+/// One candidate equals `x(d_C * P_enroll)` iff the card computed `d_C * B` live.
+pub fn p256_unblind_ecdh_candidates(
+    blind: P256BlindState,
+    card_ecdh_x: &[u8],
+) -> Result<Vec<Zeroizing<[u8; 32]>>> {
+    if card_ecdh_x.len() != 32 || is_all_zero(card_ecdh_x) {
+        return Err(AuthError::Crypto(
+            "invalid ECDH shared secret from card".into(),
+        ));
+    }
+
+    let mut compressed = Zeroizing::new([0u8; 33]);
+    compressed[0] = 0x02;
+    compressed[1..33].copy_from_slice(card_ecdh_x);
+
+    let r_even = PublicKey::from_sec1_bytes(compressed.as_ref())
+        .map_err(|_| AuthError::WrongCard)?
+        .to_projective();
+    let r_odd = -r_even;
+
+    let offset = blind.card_pub_proj * **blind.scalar;
+    let mut out = Vec::with_capacity(2);
+    for cand_proj in [r_even - offset, r_odd - offset] {
+        let cand_aff = p256::AffinePoint::from(cand_proj);
+        if let Ok(cand_pk) = PublicKey::from_affine(cand_aff) {
+            let mut raw_pt = Zeroizing::new(cand_pk.to_encoded_point(false).as_bytes().to_vec());
+            if raw_pt.len() == 65 {
+                let mut x_bytes = Zeroizing::new([0u8; 32]);
+                x_bytes.copy_from_slice(&raw_pt[1..33]);
+                if !is_all_zero(x_bytes.as_ref()) {
+                    out.push(x_bytes);
+                }
+            }
+            raw_pt.zeroize();
+        }
+    }
+
+    if out.is_empty() {
+        return Err(AuthError::WrongCard);
+    }
+    Ok(out)
+}
+
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -250,6 +334,32 @@ mod tests {
         let a = p256_shared_secret(s1, &p2);
         let b = p256_shared_secret(s2, &p1);
         assert_eq!(a.as_ref(), b.as_ref());
+    }
+
+    #[test]
+    fn p256_blinded_single_apdu_ecdh_recovers_exact_enrollment_secret_across_parities() {
+        let card_sk = p256::SecretKey::random(&mut OsRng);
+        let card_pk_sec1 = p256_public_to_sec1(&card_sk.public_key());
+
+        let (eph_sec, eph_pub) = p256_generate_ephemeral();
+        let eph_pub_sec1 = p256_public_to_sec1(&eph_pub);
+        let expected_static = p256_shared_secret(eph_sec, &card_sk.public_key());
+
+        // Run 32 independent blindings so both even and odd Y-coordinate parities of `d_C * B` are exercised!
+        for _ in 0..32 {
+            let (blind, blinded_pub_sec1) =
+                p256_blind_enrollment_point(&eph_pub_sec1, &card_pk_sec1).unwrap();
+            assert_ne!(blinded_pub_sec1, eph_pub_sec1);
+
+            let blinded_pk = p256_public_from_sec1(&blinded_pub_sec1).unwrap();
+            let card_raw =
+                p256::ecdh::diffie_hellman(card_sk.to_nonzero_scalar(), blinded_pk.as_affine());
+            let candidates =
+                p256_unblind_ecdh_candidates(blind, card_raw.raw_secret_bytes()).unwrap();
+            assert!(candidates
+                .iter()
+                .any(|c| constant_time_eq(c.as_ref(), expected_static.as_ref())));
+        }
     }
 
     #[test]

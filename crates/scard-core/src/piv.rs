@@ -859,7 +859,7 @@ impl<'a, T: ApduTransport + ?Sized> PivSession<'a, T> {
         if matches!((resp.sw1, resp.sw2), (0x6A, 0x80) | (0x6A, 0x84)) {
             if touch_policy != TOUCH_POLICY_NEVER {
                 return Err(AuthError::CardPolicy(
-                    "connected smart card does not support hardware Touch Policy = ALWAYS (PIV extension 0xAB rejected); select Touch Policy = NEVER for non-touch PIV cards"
+                    "connected smart card rejected the requested hardware Touch Policy (PIV extension 0xAB); try Touch = ALWAYS (if CACHED is unsupported) or Touch = NEVER for non-touch PIV cards"
                         .into(),
                 ));
             }

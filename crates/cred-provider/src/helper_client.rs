@@ -1,19 +1,26 @@
 //! Spawns `familiar-auth-helper.exe` in the same Windows Session ID over
-//! anonymous pipes and enforces a hard `TerminateProcess` timeout.
+//! anonymous pipes, streams real-time `HelperProgress::TouchRequired` events into
+//! a cancelable topmost prompt window when hardware touch is required, and enforces
+//! a hard `TerminateProcess` timeout.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use crate::touch_dialog::{run_touch_prompt_modal, DialogWaitResult, WM_APP_HELPER_EVENT};
 use scard_core::ipc::{
-    read_framed, write_framed, HelperFailureReason, HelperIcon, HelperRequest, HelperResponse,
-    MAX_IPC_FRAME_LEN,
+    read_framed, write_framed, HelperFailureReason, HelperIcon, HelperProgress, HelperRequest,
+    HelperResponse, HelperStreamFrame,
 };
-use std::io::Cursor;
+use std::ffi::c_void;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use windows::core::{BOOL, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT, HMODULE,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT, HMODULE, HWND,
+    LPARAM, WPARAM,
 };
 use windows::Win32::Security::SECURITY_ATTRIBUTES;
 use windows::Win32::Storage::FileSystem::ReadFile;
@@ -26,16 +33,34 @@ use windows::Win32::System::Threading::{
     CreateProcessW, TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, PROCESS_INFORMATION,
     STARTF_USESTDHANDLES, STARTUPINFOW,
 };
+use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 pub const DEFAULT_HELPER_TIMEOUT_MS: u32 = 10_000;
-pub const TOUCH_HELPER_TIMEOUT_MS: u32 = 22_000;
+pub const TOUCH_HELPER_TIMEOUT_MS: u32 = 25_000;
 const HELPER_EXE_NAME: &str = "familiar-auth-helper.exe";
+
+pub enum HelperInvokeOutcome {
+    Completed(HelperResponse),
+    Cancelled,
+}
+
+pub enum StreamEvent {
+    Progress(HelperProgress),
+    Final(HelperResponse),
+    Eof,
+}
 
 struct HandleGuard(HANDLE);
 
 impl HandleGuard {
     fn raw(&self) -> HANDLE {
         self.0
+    }
+
+    fn take_raw(&mut self) -> isize {
+        let v = self.0 .0 as isize;
+        self.0 = HANDLE::default();
+        v
     }
 
     fn close_now(&mut self) {
@@ -79,6 +104,24 @@ impl std::io::Write for PipeWriter {
     }
 }
 
+struct PipeReader(HandleGuard);
+
+impl std::io::Read for PipeReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let mut read_n = 0u32;
+        let cap = buf.len().min(4096);
+        // SAFETY: `self.0.raw()` is an owned anonymous read-pipe handle and `buf[..cap]` is valid.
+        let res = unsafe { ReadFile(self.0.raw(), Some(&mut buf[..cap]), Some(&mut read_n), None) };
+        if res.is_err() || read_n == 0 {
+            return Ok(0);
+        }
+        Ok(read_n as usize)
+    }
+}
+
 /// Locate `familiar-auth-helper.exe` strictly inside the same protected directory
 /// as this `familiar_cred_provider.dll` module (`GetModuleFileNameW`), never via `PATH`.
 pub fn locate_sibling_helper_exe() -> Result<PathBuf, String> {
@@ -115,41 +158,69 @@ fn generic_failure(icon: HelperIcon, message: impl Into<String>) -> HelperRespon
     }
 }
 
-/// Spawn `familiar-auth-helper.exe` next to the DLL and run a single unlock request.
-pub fn invoke_auth_helper(req: &HelperRequest, timeout_ms: u32) -> HelperResponse {
+/// Spawn `familiar-auth-helper.exe` next to the DLL, showing an interactive cancelable
+/// Touch Prompt window if `HelperProgress::TouchRequired` is emitted.
+pub fn invoke_auth_helper_interactive<F>(
+    req: &HelperRequest,
+    timeout_ms: u32,
+    on_creating_window: F,
+) -> HelperInvokeOutcome
+where
+    F: FnOnce() -> Option<HWND>,
+{
     let helper_path = match locate_sibling_helper_exe() {
         Ok(path) => path,
         Err(_) => {
-            return generic_failure(
+            return HelperInvokeOutcome::Completed(generic_failure(
                 HelperIcon::Error,
                 "Authentication helper path could not be resolved.",
-            );
+            ));
         }
     };
-    invoke_auth_helper_at(&helper_path, &[], req, timeout_ms)
+    invoke_auth_helper_interactive_at(&helper_path, &[], req, timeout_ms, on_creating_window)
 }
 
-/// Spawn a specific helper executable path with optional arguments and a hard timeout.
+/// Non-interactive convenience wrapper used by headless tests.
+#[cfg(test)]
 pub fn invoke_auth_helper_at(
     helper_exe: &Path,
     extra_args: &[&str],
     req: &HelperRequest,
     timeout_ms: u32,
 ) -> HelperResponse {
+    match invoke_auth_helper_interactive_at(helper_exe, extra_args, req, timeout_ms, || None) {
+        HelperInvokeOutcome::Completed(resp) => resp,
+        HelperInvokeOutcome::Cancelled => {
+            generic_failure(HelperIcon::Warning, "Sign-in cancelled.")
+        }
+    }
+}
+
+/// Spawn a specific helper executable path with streaming progress + cancelable UI support.
+pub fn invoke_auth_helper_interactive_at<F>(
+    helper_exe: &Path,
+    extra_args: &[&str],
+    req: &HelperRequest,
+    timeout_ms: u32,
+    on_creating_window: F,
+) -> HelperInvokeOutcome
+where
+    F: FnOnce() -> Option<HWND>,
+{
     if !helper_exe.exists() {
-        return generic_failure(
+        return HelperInvokeOutcome::Completed(generic_failure(
             HelperIcon::Error,
             "Authentication helper executable is missing. Re-run FamiliarSmartcard setup.",
-        );
+        ));
     }
 
     let encoded_req = match req.encode() {
         Ok(bytes) => bytes,
         Err(_) => {
-            return generic_failure(
+            return HelperInvokeOutcome::Completed(generic_failure(
                 HelperIcon::Error,
                 "Failed to encode authentication request.",
-            );
+            ));
         }
     };
 
@@ -163,7 +234,10 @@ pub fn invoke_auth_helper_at(
     let mut stdin_write_raw = HANDLE::default();
     // SAFETY: Creates anonymous pipe with `4096`-byte kernel buffer (> `MAX_IPC_FRAME_LEN`).
     if unsafe { CreatePipe(&mut stdin_read_raw, &mut stdin_write_raw, Some(&sa), 4096) }.is_err() {
-        return generic_failure(HelperIcon::Error, "Failed to create helper input pipe.");
+        return HelperInvokeOutcome::Completed(generic_failure(
+            HelperIcon::Error,
+            "Failed to create helper input pipe.",
+        ));
     }
     let mut child_stdin_read = HandleGuard(stdin_read_raw);
     let mut parent_stdin_write = HandleGuard(stdin_write_raw);
@@ -173,9 +247,12 @@ pub fn invoke_auth_helper_at(
     // SAFETY: Creates anonymous output pipe with `4096`-byte kernel buffer.
     if unsafe { CreatePipe(&mut stdout_read_raw, &mut stdout_write_raw, Some(&sa), 4096) }.is_err()
     {
-        return generic_failure(HelperIcon::Error, "Failed to create helper output pipe.");
+        return HelperInvokeOutcome::Completed(generic_failure(
+            HelperIcon::Error,
+            "Failed to create helper output pipe.",
+        ));
     }
-    let parent_stdout_read = HandleGuard(stdout_read_raw);
+    let mut parent_stdout_read = HandleGuard(stdout_read_raw);
     let mut child_stdout_write = HandleGuard(stdout_write_raw);
 
     // Prevent the child from inheriting the parent's ends of the pipes.
@@ -194,20 +271,20 @@ pub fn invoke_auth_helper_at(
             )
             .is_err()
         {
-            return generic_failure(
+            return HelperInvokeOutcome::Completed(generic_failure(
                 HelperIcon::Error,
                 "Failed to configure helper pipe inheritance.",
-            );
+            ));
         }
     }
 
     // Write the entire bounded request frame (`<= 1026` bytes) into the 4096-byte kernel
     // pipe buffer and immediately close the write end so the child observes EOF cleanly.
     if write_framed(PipeWriter(parent_stdin_write.raw()), &encoded_req).is_err() {
-        return generic_failure(
+        return HelperInvokeOutcome::Completed(generic_failure(
             HelperIcon::Error,
             "Failed to send request to authentication helper.",
-        );
+        ));
     }
     parent_stdin_write.close_now();
 
@@ -246,78 +323,155 @@ pub fn invoke_auth_helper_at(
         )
     };
 
-    // Always close child-side pipe handles in the parent immediately after `CreateProcessW`.
+    // Always close child-side pipe handles in the parent immediately after `CreateProcessW`
+    // so terminating the child process immediately unblocks the reader thread with EOF!
     child_stdin_read.close_now();
     child_stdout_write.close_now();
 
     if spawn_res.is_err() {
-        return generic_failure(HelperIcon::Error, "Failed to launch authentication helper.");
+        return HelperInvokeOutcome::Completed(generic_failure(
+            HelperIcon::Error,
+            "Failed to launch authentication helper.",
+        ));
     }
 
     let proc_handle = HandleGuard(proc_info.hProcess);
     let _thread_handle = HandleGuard(proc_info.hThread);
 
-    // Hard timeout wait on the helper process.
-    // SAFETY: `proc_handle.raw()` is a valid process handle.
-    let wait_status = unsafe { WaitForSingleObject(proc_handle.raw(), timeout_ms) };
-    if wait_status == WAIT_TIMEOUT {
-        // SAFETY: Hard-kill the hung helper process so `LogonUI.exe` immediately unblocks!
-        unsafe {
-            let _ = TerminateProcess(proc_handle.raw(), 1);
-            let _ = WaitForSingleObject(proc_handle.raw(), 1_000);
-        }
-        return generic_failure(
-            HelperIcon::Warning,
-            "Smart card timed out. Check your PIV smart card / RDP redirection, or click Sign-in options to use your recovery password.",
-        );
-    }
-    if wait_status != WAIT_OBJECT_0 {
-        return generic_failure(
-            HelperIcon::Error,
-            "Waiting on authentication helper failed.",
-        );
-    }
+    let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
+    let notify_hwnd = Arc::new(AtomicIsize::new(0));
+    let reader_notify = Arc::clone(&notify_hwnd);
+    let (tx, rx) = mpsc::channel::<StreamEvent>();
+    let stdout_raw = parent_stdout_read.take_raw();
 
-    // Child has exited and write end is closed; `ReadFile` is guaranteed non-blocking.
-    let mut raw_out = zeroize::Zeroizing::new(Vec::with_capacity(MAX_IPC_FRAME_LEN + 4));
-    let mut chunk = zeroize::Zeroizing::new([0u8; 512]);
-    loop {
-        let mut read_n = 0u32;
-        // SAFETY: `parent_stdout_read` is open and `chunk` is valid.
-        let ok = unsafe {
-            ReadFile(
-                parent_stdout_read.raw(),
-                Some(chunk.as_mut()),
-                Some(&mut read_n),
-                None,
-            )
-        };
-        if ok.is_err() || read_n == 0 {
-            break;
+    // Stream IPC frames from the child's stdout pipe on a dedicated reader thread.
+    let reader_thread = std::thread::spawn(move || {
+        let mut pipe = PipeReader(HandleGuard(HANDLE(stdout_raw as *mut c_void)));
+        const MAX_FRAMES: usize = 16;
+        for _ in 0..MAX_FRAMES {
+            let Ok(raw_frame) = read_framed(&mut pipe) else {
+                let _ = tx.send(StreamEvent::Eof);
+                wake_dialog(&reader_notify);
+                return;
+            };
+            match HelperStreamFrame::decode(&raw_frame) {
+                Ok(HelperStreamFrame::Progress(prog)) => {
+                    let _ = tx.send(StreamEvent::Progress(prog));
+                    wake_dialog(&reader_notify);
+                }
+                Ok(HelperStreamFrame::Final(resp)) => {
+                    let _ = tx.send(StreamEvent::Final(resp));
+                    wake_dialog(&reader_notify);
+                    return;
+                }
+                Err(_) => {
+                    let _ = tx.send(StreamEvent::Final(generic_failure(
+                        HelperIcon::Error,
+                        "Malformed response from authentication helper.",
+                    )));
+                    wake_dialog(&reader_notify);
+                    return;
+                }
+            }
         }
-        let n = read_n as usize;
-        if raw_out.len() + n > MAX_IPC_FRAME_LEN + 4 {
-            return generic_failure(
-                HelperIcon::Error,
-                "Authentication helper returned an oversized response.",
-            );
-        }
-        raw_out.extend_from_slice(&chunk[..n]);
-    }
+        let _ = tx.send(StreamEvent::Eof);
+        wake_dialog(&reader_notify);
+    });
 
-    let Ok(frame) = read_framed(Cursor::new(raw_out.as_slice())) else {
-        return generic_failure(
-            HelperIcon::Error,
-            "Authentication helper exited without a valid response.",
-        );
+    // Phase A: Wait before opening any GUI window (`Touch=NEVER` and wrong-PIN attempts
+    // complete here in ~50ms without ever flashing a window!).
+    let outcome = if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        match rx.recv_timeout(remaining) {
+            Ok(StreamEvent::Final(resp)) => {
+                // SAFETY: Reap child exit cleanly.
+                unsafe {
+                    let _ = WaitForSingleObject(proc_handle.raw(), 500);
+                }
+                HelperInvokeOutcome::Completed(resp)
+            }
+            Ok(StreamEvent::Progress(HelperProgress::TouchRequired { step, total })) => {
+                // Phase B: Card PIN verified and hardware touch is now actively required!
+                // Give the user a full `TOUCH_HELPER_TIMEOUT_MS` window from prompt appearance.
+                let touch_deadline = deadline.max(
+                    Instant::now() + Duration::from_millis(u64::from(TOUCH_HELPER_TIMEOUT_MS)),
+                );
+                let owner_hwnd = on_creating_window();
+                match run_touch_prompt_modal(
+                    owner_hwnd,
+                    step,
+                    total,
+                    touch_deadline,
+                    &rx,
+                    &notify_hwnd,
+                ) {
+                    DialogWaitResult::Completed(resp) => {
+                        unsafe {
+                            let _ = WaitForSingleObject(proc_handle.raw(), 500);
+                        }
+                        HelperInvokeOutcome::Completed(resp)
+                    }
+                    DialogWaitResult::Cancelled => {
+                        kill_helper(&proc_handle);
+                        HelperInvokeOutcome::Cancelled
+                    }
+                    DialogWaitResult::TimedOut => {
+                        kill_helper(&proc_handle);
+                        HelperInvokeOutcome::Completed(timeout_failure())
+                    }
+                    DialogWaitResult::PipeBroken => {
+                        kill_helper(&proc_handle);
+                        HelperInvokeOutcome::Completed(generic_failure(
+                            HelperIcon::Error,
+                            "Authentication helper exited unexpectedly.",
+                        ))
+                    }
+                }
+            }
+            Ok(StreamEvent::Eof) | Err(RecvTimeoutError::Disconnected) => {
+                kill_helper(&proc_handle);
+                HelperInvokeOutcome::Completed(generic_failure(
+                    HelperIcon::Error,
+                    "Authentication helper exited without a valid response.",
+                ))
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                kill_helper(&proc_handle);
+                HelperInvokeOutcome::Completed(timeout_failure())
+            }
+        }
+    } else {
+        kill_helper(&proc_handle);
+        HelperInvokeOutcome::Completed(timeout_failure())
     };
 
-    HelperResponse::decode(&frame).unwrap_or_else(|_| {
-        generic_failure(
-            HelperIcon::Error,
-            "Malformed response from authentication helper.",
-        )
-    })
+    let _ = reader_thread.join();
+    outcome
+}
+
+fn wake_dialog(notify_hwnd: &AtomicIsize) {
+    let raw = notify_hwnd.load(Ordering::SeqCst);
+    if raw != 0 {
+        let hwnd = HWND(raw as *mut c_void);
+        // SAFETY: Posts benign wakeup message; `raw` is cleared before `DestroyWindow`.
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_APP_HELPER_EVENT, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+fn kill_helper(proc_handle: &HandleGuard) {
+    // SAFETY: Hard-kills helper child process and waits briefly for kernel handle cleanup.
+    unsafe {
+        let _ = TerminateProcess(proc_handle.raw(), 1);
+        let _ = WaitForSingleObject(proc_handle.raw(), 1_000);
+    }
+}
+
+fn timeout_failure() -> HelperResponse {
+    generic_failure(
+        HelperIcon::Warning,
+        "Smart card timed out waiting for response or touch. Try again, or click Sign-in options to use your recovery password.",
+    )
 }
 
 #[cfg(test)]

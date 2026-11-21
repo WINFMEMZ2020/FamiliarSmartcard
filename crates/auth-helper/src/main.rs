@@ -9,9 +9,10 @@
 #![forbid(unsafe_code)]
 
 use scard_core::ipc::{
-    read_framed, write_framed, HelperFailureReason, HelperIcon, HelperOperation, HelperRequest,
-    HelperResponse,
+    read_framed, write_framed, HelperFailureReason, HelperIcon, HelperOperation, HelperProgress,
+    HelperRequest, HelperResponse, HelperStreamFrame,
 };
+use scard_core::piv::{TOUCH_POLICY_ALWAYS, TOUCH_POLICY_CACHED};
 use scard_core::storage::{
     check_last_attempt_cooldown, clear_last_attempt_cooldown, read_card_auth_9e_pub,
     start_last_attempt_cooldown, LAST_ATTEMPT_COOLDOWN_SECS,
@@ -20,6 +21,7 @@ use scard_core::AuthError;
 use std::io;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
 
 const EXPLICIT_USER_UNIFORM_FLOOR: Duration = Duration::from_millis(220);
 const EXPLICIT_USER_UNIFORM_MSG: &str =
@@ -49,12 +51,47 @@ fn main() -> ExitCode {
         },
     };
 
-    if let Ok(encoded) = response.encode() {
+    if let Ok(encoded) = HelperStreamFrame::Final(response).encode() {
         let stdout = io::stdout();
         let _ = write_framed(stdout.lock(), &encoded);
     }
 
     ExitCode::SUCCESS
+}
+
+fn emit_progress(progress: HelperProgress) {
+    if let Ok(encoded) = HelperStreamFrame::Progress(progress).encode() {
+        let stdout = io::stdout();
+        let _ = write_framed(stdout.lock(), &encoded);
+    }
+}
+
+fn unlock_connected_with_progress(
+    connected: scard_core::CardConnected,
+    pin: &Zeroizing<Vec<u8>>,
+) -> Result<Zeroizing<String>, AuthError> {
+    let touch_policy = connected.detected_touch_policy();
+    let verified = connected.verify_pin(pin)?;
+
+    if touch_policy == TOUCH_POLICY_ALWAYS {
+        // Strict 2-touch mode: explicit dynamic freshness ECDH + static unwrap ECDH.
+        emit_progress(HelperProgress::TouchRequired { step: 1, total: 2 });
+        let fresh = verified.prove_freshness()?;
+        let verified_unwrap = fresh.verify_pin_for_unwrap(pin)?;
+        emit_progress(HelperProgress::TouchRequired { step: 2, total: 2 });
+        let unwrapped = verified_unwrap.unwrap_dek()?;
+        return unwrapped.decrypt_credential().map(|c| c.into_password());
+    }
+
+    if touch_policy == TOUCH_POLICY_CACHED {
+        // Single-touch mode: Blinded P-256 ECDH (`B = P_enroll + b * G`) proves anti-replay
+        // freshness AND unwraps DEK in ONE single `00 87` APDU, guaranteeing 1 physical
+        // button press even on cards (e.g. RS-Key PIV) that prompt on every `00 87`!
+        emit_progress(HelperProgress::TouchRequired { step: 1, total: 1 });
+    }
+
+    let unwrapped = verified.unwrap_dek_blinded_single_touch()?;
+    unwrapped.decrypt_credential().map(|c| c.into_password())
 }
 
 fn uniform_explicit_failure(started: Instant) -> HelperResponse {
@@ -265,13 +302,7 @@ fn handle_unlock(
         }
     }
 
-    let unlock_res = connected
-        .verify_pin(pin)
-        .and_then(|v| v.prove_freshness())
-        .and_then(|f| f.verify_pin_for_unwrap(pin))
-        .and_then(|u| u.unwrap_dek())
-        .and_then(|k| k.decrypt_credential())
-        .map(|cred| cred.into_password());
+    let unlock_res = unlock_connected_with_progress(connected, pin);
 
     match unlock_res {
         Ok(password) => {
@@ -389,7 +420,11 @@ fn handle_unblock_and_unlock(
         };
     }
 
-    match scard_core::unlock(vault, sid, username, computer, None, new_pin) {
+    let post_unblock = scard_core::AuthPipeline::start(vault, sid, username, computer)
+        .and_then(|loaded| loaded.connect_card(None))
+        .and_then(|connected| unlock_connected_with_progress(connected, new_pin));
+
+    match post_unblock {
         Ok(password) => HelperResponse::Success {
             domain: domain.to_string(),
             username: username.to_string(),

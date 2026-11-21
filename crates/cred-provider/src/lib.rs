@@ -14,6 +14,7 @@ mod guids;
 mod helper_client;
 mod kerb;
 mod provider;
+mod touch_dialog;
 
 use std::ffi::c_void;
 use windows::core::{

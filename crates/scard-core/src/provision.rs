@@ -11,7 +11,8 @@ use crate::piv::{
     find_tlv, find_tlv_recursive, pad_pin_bytes, tlv_ber, validate_slot_9d_policy, ApduTransport,
     PivSession, ALG_3DES, ALG_AES_128, ALG_AES_192, ALG_AES_256, DEFAULT_MGMT_KEY,
     OID_CERT_CARD_AUTH, OID_CERT_KEY_MANAGEMENT, OID_PRINTED_INFO, PIN_POLICY_ALWAYS,
-    PIN_POLICY_NEVER, SLOT_CARD_AUTH, SLOT_KEY_MANAGEMENT, TOUCH_POLICY_ALWAYS, TOUCH_POLICY_NEVER,
+    PIN_POLICY_NEVER, SLOT_CARD_AUTH, SLOT_KEY_MANAGEMENT, TOUCH_POLICY_ALWAYS,
+    TOUCH_POLICY_CACHED, TOUCH_POLICY_NEVER,
 };
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
@@ -103,16 +104,16 @@ pub fn card_has_9d_key(reader: Option<&str>) -> bool {
     false
 }
 
-/// Provision `Slot 0x9D` (with `TOUCH_POLICY_ALWAYS` or `TOUCH_POLICY_NEVER`), optionally
-/// `Slot 0x9E` (`PIN=NEVER`, `Touch=NEVER`), write matching PIV X.509 certificates, and
-/// optionally rotate `Slot 0x9B` Management Key on the connected PIV smart card.
+/// Provision `Slot 0x9D` (with `TOUCH_POLICY_CACHED`, `TOUCH_POLICY_ALWAYS`, or `TOUCH_POLICY_NEVER`),
+/// optionally `Slot 0x9E` (`PIN=NEVER`, `Touch=NEVER`), write matching PIV X.509 certificates,
+/// and optionally rotate `Slot 0x9B` Management Key on the connected PIV smart card.
 pub fn provision_card(opts: &CardProvisionOptions<'_>) -> Result<CardProvisionResult> {
     if !matches!(
         opts.touch_policy_9d,
-        TOUCH_POLICY_ALWAYS | TOUCH_POLICY_NEVER
+        TOUCH_POLICY_CACHED | TOUCH_POLICY_ALWAYS | TOUCH_POLICY_NEVER
     ) {
         return Err(AuthError::CardPolicy(
-            "Slot 0x9D touch policy must be ALWAYS (0x02) or NEVER (0x01)".into(),
+            "Slot 0x9D touch policy must be CACHED (0x03), ALWAYS (0x02), or NEVER (0x01)".into(),
         ));
     }
     if let Some(pin) = opts.pin {
@@ -176,10 +177,10 @@ pub fn provision_card_with_transport<T: ApduTransport>(
 ) -> Result<CardProvisionResult> {
     if !matches!(
         opts.touch_policy_9d,
-        TOUCH_POLICY_ALWAYS | TOUCH_POLICY_NEVER
+        TOUCH_POLICY_CACHED | TOUCH_POLICY_ALWAYS | TOUCH_POLICY_NEVER
     ) {
         return Err(AuthError::CardPolicy(
-            "Slot 0x9D touch policy must be ALWAYS (0x02) or NEVER (0x01)".into(),
+            "Slot 0x9D touch policy must be CACHED (0x03), ALWAYS (0x02), or NEVER (0x01)".into(),
         ));
     }
 
@@ -228,11 +229,12 @@ pub fn provision_card_with_transport<T: ApduTransport>(
     if let Some(meta_9d) = session.get_metadata(SLOT_KEY_MANAGEMENT)? {
         let parsed = meta_9d.parse();
         validate_slot_9d_policy(&parsed)?;
-        if opts.touch_policy_9d == TOUCH_POLICY_ALWAYS
-            && parsed.touch_policy != Some(TOUCH_POLICY_ALWAYS)
+        if opts.touch_policy_9d != TOUCH_POLICY_NEVER
+            && parsed.touch_policy != Some(opts.touch_policy_9d)
         {
             return Err(AuthError::CardPolicy(
-                "card generated 0x9D key without enforcing Touch Policy = ALWAYS".into(),
+                "card generated 0x9D key without enforcing the requested hardware Touch Policy"
+                    .into(),
             ));
         }
     }
@@ -611,7 +613,7 @@ mod tests {
                     }
                     let ac = find_tlv(&apdu[5..], 0xAC).unwrap();
                     let tp = find_tlv(ac, 0xAB).unwrap()[0];
-                    if tp == TOUCH_POLICY_ALWAYS && !self.supports_touch_always {
+                    if tp != TOUCH_POLICY_NEVER && !self.supports_touch_always {
                         return Ok(vec![0x6A, 0x80]);
                     }
                     let pk = if slot == SLOT_KEY_MANAGEMENT {
@@ -729,7 +731,22 @@ mod tests {
         assert_eq!(ok_never.touch_policy_9d, TOUCH_POLICY_NEVER);
         assert_eq!(ok_never.mgmt_alg_used, ALG_AES_256);
 
-        // 4. Non-touch card strictly FAILS CLOSED when Touch = ALWAYS is requested!
+        // 3b. Re-provision same card switching to Touch = CACHED (single touch + immediate reset)!
+        let ok_cached = provision_card_with_transport(
+            &card,
+            &CardProvisionOptions {
+                reader: None,
+                pin: Some(b"123456"),
+                touch_policy_9d: TOUCH_POLICY_CACHED,
+                provision_9e: true,
+                current_mgmt_key_hex: Some(new_k256),
+                new_mgmt_key_hex: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(ok_cached.touch_policy_9d, TOUCH_POLICY_CACHED);
+
+        // 4. Non-touch card strictly FAILS CLOSED when Touch = ALWAYS or CACHED is requested!
         let non_touch_card =
             SimulatedProvisionCard::new(ALG_3DES, DEFAULT_MGMT_KEY.to_vec(), false);
         let fail_closed = provision_card_with_transport(
