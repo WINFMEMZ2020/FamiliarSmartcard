@@ -137,11 +137,27 @@ fn handle_unlock(
     computer: &str,
     pin: &mut zeroize::Zeroizing<Vec<u8>>,
 ) -> HelperResponse {
-    // Enforce the 60s safety cooldown before allowing the final (3rd) PIN attempt.
-    if let Ok(Some(rem_secs)) = check_last_attempt_cooldown(&vault.card_pub_fingerprint) {
-        match scard_core::query_card_pin_remaining(None, &vault.card_pub_fingerprint) {
+    let card_fp = vault.card_pub_fingerprint;
+
+    let connected = match scard_core::AuthPipeline::start(vault, sid, username, computer)
+        .and_then(|loaded| loaded.connect_card(None))
+    {
+        Ok(c) => c,
+        Err(error) => {
+            return HelperResponse::Failure {
+                reason: HelperFailureReason::Generic,
+                icon: icon_for_error(&error),
+                message: format_user_error(&error),
+            };
+        }
+    };
+
+    // Enforce the 60s safety cooldown INSIDE the exclusive PC/SC card transaction
+    // so concurrent Console + RDP sessions can never race past the final-try gate!
+    if let Ok(Some(rem_secs)) = check_last_attempt_cooldown(&card_fp) {
+        match connected.query_pin_remaining() {
             Ok(Some(0)) => {
-                let _ = clear_last_attempt_cooldown(&vault.card_pub_fingerprint);
+                let _ = clear_last_attempt_cooldown(&card_fp);
                 return HelperResponse::Failure {
                     reason: HelperFailureReason::PinBlocked,
                     icon: HelperIcon::Error,
@@ -150,7 +166,7 @@ fn handle_unlock(
             }
             Ok(Some(r)) if r > 1 => {
                 // Card was already unblocked/verified elsewhere; clear stale cooldown.
-                let _ = clear_last_attempt_cooldown(&vault.card_pub_fingerprint);
+                let _ = clear_last_attempt_cooldown(&card_fp);
             }
             Ok(_) => {
                 return HelperResponse::Failure {
@@ -171,8 +187,15 @@ fn handle_unlock(
         }
     }
 
-    let card_fp = vault.card_pub_fingerprint;
-    match scard_core::unlock(vault, sid, username, computer, None, pin) {
+    let unlock_res = connected
+        .verify_pin(pin)
+        .and_then(|v| v.prove_freshness())
+        .and_then(|f| f.verify_pin_for_unwrap(pin))
+        .and_then(|u| u.unwrap_dek())
+        .and_then(|k| k.decrypt_credential())
+        .map(|cred| cred.into_password());
+
+    match unlock_res {
         Ok(password) => {
             let _ = clear_last_attempt_cooldown(&card_fp);
             HelperResponse::Success { password }
@@ -212,14 +235,36 @@ fn handle_unblock_and_unlock(
     new_pin: &mut zeroize::Zeroizing<Vec<u8>>,
 ) -> HelperResponse {
     let card_fp = vault.card_pub_fingerprint;
-    if let Err(error) =
-        scard_core::unblock_card_pin(None, Some(&card_fp), puk.as_slice(), new_pin.as_slice())
-    {
+    // On the Lock Screen, `require_pin_blocked = true` prevents unblocked cards from
+    // having their PUK tested or intentionally exhausted!
+    if let Err(error) = scard_core::unblock_card_pin(
+        None,
+        Some(&card_fp),
+        true,
+        puk.as_slice(),
+        new_pin.as_slice(),
+    ) {
         return match error {
+            AuthError::PukIncorrect(1) => HelperResponse::Failure {
+                reason: HelperFailureReason::CooldownActive,
+                icon: HelperIcon::Warning,
+                message: format!(
+                    "Incorrect Familiar Smartcard PUK — ONLY 1 PUK ATTEMPT REMAINING before permanent applet lock! Waiting {LAST_ATTEMPT_COOLDOWN_SECS}s safety cooldown."
+                ),
+            },
             AuthError::PukIncorrect(rem) => HelperResponse::Failure {
                 reason: HelperFailureReason::PukIncorrect,
                 icon: HelperIcon::Error,
-                message: format!("Incorrect Familiar Smartcard PUK ({rem} PUK attempt(s) remaining)."),
+                message: format!(
+                    "Incorrect Familiar Smartcard PUK ({rem} PUK attempt(s) remaining)."
+                ),
+            },
+            AuthError::LastAttemptCooldown { remaining_secs } => HelperResponse::Failure {
+                reason: HelperFailureReason::CooldownActive,
+                icon: HelperIcon::Warning,
+                message: format!(
+                    "Final PUK attempt safety cooldown active ({remaining_secs}s remaining). Only 1 PUK attempt left before permanent card lock!"
+                ),
             },
             AuthError::PukBlocked => HelperResponse::Failure {
                 reason: HelperFailureReason::PukBlocked,

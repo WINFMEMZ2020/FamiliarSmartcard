@@ -19,6 +19,7 @@ use windows::Win32::Security::Credentials::{
     SCardEstablishContext, SCardGetAttrib, SCardListReadersW, SCardReleaseContext, SCardTransmit,
     SCARD_IO_REQUEST, SCARD_PROTOCOL_T0, SCARD_PROTOCOL_T1, SCARD_SCOPE_USER, SCARD_SHARE_SHARED,
 };
+use zeroize::Zeroizing;
 
 const SCARD_S_SUCCESS: i32 = 0;
 const SCARD_E_NO_READERS_AVAILABLE: i32 = 0x8010_002E_u32 as i32;
@@ -230,12 +231,14 @@ impl ScardCard {
     }
 
     /// Send one APDU and return the raw response (data + SW1SW2).
+    /// Uses a `Zeroizing` scratch buffer so sensitive responses (such as ECDH shared
+    /// secrets) never remain in unzeroized heap pages.
     pub fn transmit(&self, apdu: &[u8]) -> Result<Vec<u8>> {
         let io = SCARD_IO_REQUEST {
             dwProtocol: self.protocol,
             cbPciLength: size_of::<SCARD_IO_REQUEST>() as u32,
         };
-        let mut response = vec![0u8; 65536];
+        let mut response = Zeroizing::new(vec![0u8; 65536]);
         let mut response_len = response.len() as u32;
         // SAFETY: `io`, `apdu`, and `response` are valid buffers for the duration of the call.
         let rc = unsafe {
@@ -251,8 +254,8 @@ impl ScardCard {
         if rc != SCARD_S_SUCCESS {
             return Err(pcsc_error(rc));
         }
-        response.truncate((response_len as usize).min(response.len()));
-        Ok(response)
+        let valid_len = (response_len as usize).min(response.len());
+        Ok(response[..valid_len].to_vec())
     }
 
     /// Read the ATR via `SCARD_ATTR_ATR_STRING`.

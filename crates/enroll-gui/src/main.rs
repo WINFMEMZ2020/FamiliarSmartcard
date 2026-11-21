@@ -89,6 +89,8 @@ struct PreparedRotation {
     fingerprint_hex: String,
     f9_status: String,
     touch_policy: u8,
+    pin_is_default: bool,
+    puk_is_default: bool,
 }
 
 enum WorkerOutcome {
@@ -392,7 +394,11 @@ fn clear_attestation_cli() -> windows::core::Result<()> {
 fn unblock_pin_cli(puk_arg: &str, new_pin_arg: &str) -> windows::core::Result<()> {
     let puk = Zeroizing::new(puk_arg.as_bytes().to_vec());
     let new_pin = Zeroizing::new(new_pin_arg.as_bytes().to_vec());
-    match unblock_card_pin(None, None, &puk, &new_pin) {
+    let expected_fp = scard_core::current_user()
+        .ok()
+        .and_then(|u| read_vault(&u.sid).ok().flatten())
+        .map(|v| v.card_pub_fingerprint);
+    match unblock_card_pin(None, expected_fp.as_ref(), false, &puk, &new_pin) {
         Ok(fp_opt) => {
             if let Some(fp) = fp_opt {
                 let _ = clear_last_attempt_cooldown(&fp);
@@ -974,6 +980,8 @@ unsafe fn start_setup_with_rotation(hwnd: HWND) {
                 fingerprint_hex: hex::encode(enrolled.card_pub_fingerprint),
                 f9_status,
                 touch_policy: enrolled.touch_policy,
+                pin_is_default: enrolled.pin_is_default,
+                puk_is_default: enrolled.puk_is_default,
             })
         })();
 
@@ -1107,6 +1115,12 @@ unsafe fn commit_confirmed_rotation(hwnd: HWND, prepared: PreparedRotation) {
                     report.push_str(
                         "\r\nSECURITY WARNING: Windows Account Lockout Threshold is currently 0 (disabled).\r\n\
                          Run `net accounts /lockoutthreshold:5` in an elevated shell before enabling RDP.\r\n",
+                    );
+                }
+                if prepared.pin_is_default || prepared.puk_is_default {
+                    report.push_str(
+                        "\r\nSECURITY WARNING: Your smart card PIN (123456) and/or PUK (12345678) is still set to the factory default!\r\n\
+                         Click 'Unblock PIN / PUK...' to set a custom PUK and PIN before production deployment.\r\n",
                     );
                 }
                 post_outcome(
@@ -1248,6 +1262,12 @@ unsafe fn start_rebind_existing_password(hwnd: HWND) {
             if safety.lockout_threshold == 0 {
                 msg.push_str(
                     "\r\nSECURITY WARNING: Account Lockout Threshold is 0. Enable `net accounts /lockoutthreshold:5`.\r\n",
+                );
+            }
+            if enrolled.pin_is_default || enrolled.puk_is_default {
+                msg.push_str(
+                    "\r\nSECURITY WARNING: Your smart card PIN (123456) and/or PUK (12345678) is still set to the factory default!\r\n\
+                     Click 'Unblock PIN / PUK...' to set a custom PUK and PIN before production deployment.\r\n",
                 );
             }
             Ok(msg)

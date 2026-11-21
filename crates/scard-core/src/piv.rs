@@ -6,7 +6,7 @@
 
 use crate::error::{AuthError, Result};
 use crate::pcsc::ScardCard;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Full PIV AID: A0 00 00 03 08 00 00 10 00 01 00.
 pub const PIV_AID: [u8; 11] = [
@@ -52,12 +52,19 @@ pub trait ApduTransport {
     fn mark_pin_attempted(&self) {}
 }
 
-/// SW1/SW2 plus response data.
+/// SW1/SW2 plus response data. Automatically zeroized on drop so APDU payloads
+/// (such as ECDH shared secrets) do not linger in process heap memory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApduResponse {
     pub data: Vec<u8>,
     pub sw1: u8,
     pub sw2: u8,
+}
+
+impl Drop for ApduResponse {
+    fn drop(&mut self) {
+        self.data.zeroize();
+    }
 }
 
 impl ApduResponse {
@@ -220,11 +227,11 @@ impl<'a, T: ApduTransport + ?Sized> PivSession<'a, T> {
 
     /// Transmit one APDU and transparently handle ISO 7816 `61xx` / `6Cxx`.
     pub fn transmit(&self, apdu: &[u8]) -> Result<ApduResponse> {
-        let mut current = apdu.to_vec();
-        let mut data = Vec::new();
+        let mut current = Zeroizing::new(apdu.to_vec());
+        let mut data = Zeroizing::new(Vec::new());
 
         for _ in 0..MAX_CHAINING_ROUNDS {
-            let raw = self.card.transmit_apdu(&current)?;
+            let raw = Zeroizing::new(self.card.transmit_apdu(&current)?);
             if raw.len() < 2 {
                 return Err(AuthError::Internal(
                     "APDU response shorter than SW1SW2".into(),
@@ -242,7 +249,7 @@ impl<'a, T: ApduTransport + ?Sized> PivSession<'a, T> {
 
             if sw1 == 0x61 {
                 data.extend_from_slice(chunk);
-                current = vec![0x00, 0xC0, 0x00, 0x00, sw2];
+                *current = vec![0x00, 0xC0, 0x00, 0x00, sw2];
                 continue;
             }
             if sw1 == 0x6C {
@@ -253,7 +260,12 @@ impl<'a, T: ApduTransport + ?Sized> PivSession<'a, T> {
             }
 
             data.extend_from_slice(chunk);
-            return Ok(ApduResponse { data, sw1, sw2 });
+            let owned = std::mem::take(&mut *data);
+            return Ok(ApduResponse {
+                data: owned,
+                sw1,
+                sw2,
+            });
         }
 
         Err(AuthError::Internal("too many APDU chaining rounds".into()))
@@ -272,14 +284,15 @@ impl<'a, T: ApduTransport + ?Sized> PivSession<'a, T> {
                 sw2: response.sw2,
             });
         }
-        let card_name = find_tlv_recursive(&response.data, 0x50, 0)
+        let select_data = response.data.clone();
+        let card_name = find_tlv_recursive(&select_data, 0x50, 0)
             .and_then(|v| String::from_utf8(v.to_vec()).ok());
-        let algorithms = find_tlv_recursive(&response.data, 0x80, 0)
+        let algorithms = find_tlv_recursive(&select_data, 0x80, 0)
             .map(|v| v.to_vec())
             .unwrap_or_default();
 
         Ok(SelectInfo {
-            raw: response.data,
+            raw: select_data,
             card_name,
             algorithms,
         })
@@ -302,7 +315,7 @@ impl<'a, T: ApduTransport + ?Sized> PivSession<'a, T> {
 
         let response = self.transmit(&apdu)?;
         match (response.sw1, response.sw2) {
-            (0x90, 0x00) => Ok(Some(response.data)),
+            (0x90, 0x00) => Ok(Some(response.data.clone())),
             (0x6A, 0x82) | (0x6A, 0x88) => Ok(None),
             _ => Err(AuthError::Apdu {
                 sw1: response.sw1,
@@ -317,7 +330,9 @@ impl<'a, T: ApduTransport + ?Sized> PivSession<'a, T> {
         let apdu = [0x00, 0xF7, 0x00, slot, 0x00];
         let response = self.transmit(&apdu)?;
         match (response.sw1, response.sw2) {
-            (0x90, 0x00) => Ok(Some(SlotMetadata { raw: response.data })),
+            (0x90, 0x00) => Ok(Some(SlotMetadata {
+                raw: response.data.clone(),
+            })),
             (0x6A, 0x88) | (0x6A, 0x82) | (0x6D, 0x00) | (0x6A, 0x81) => Ok(None),
             _ => Err(AuthError::Apdu {
                 sw1: response.sw1,
@@ -336,7 +351,9 @@ impl<'a, T: ApduTransport + ?Sized> PivSession<'a, T> {
         let apdu = [0x00, 0xF9, slot, 0x00, 0x00];
         let response = self.transmit(&apdu)?;
         match (response.sw1, response.sw2) {
-            (0x90, 0x00) if !response.data.is_empty() => unwrap_piv_cert_bytes(response.data),
+            (0x90, 0x00) if !response.data.is_empty() => {
+                unwrap_piv_cert_bytes(response.data.clone())
+            }
             (0x90, 0x00) | (0x6D, 0x00) | (0x6A, 0x81) | (0x6A, 0x82) | (0x6A, 0x88) => Ok(None),
             _ => Err(AuthError::Apdu {
                 sw1: response.sw1,

@@ -19,7 +19,8 @@ use crate::crypto::{
 use crate::error::{AuthError, Result};
 use crate::pcsc::{ScardContext, SCARD_LEAVE_CARD};
 use crate::piv::{
-    validate_slot_9d_policy, PivSession, KEY_REF_PIN, SLOT_KEY_MANAGEMENT, TOUCH_POLICY_NEVER,
+    validate_slot_9d_policy, ApduTransport, PivSession, KEY_REF_PIN, KEY_REF_PUK,
+    SLOT_KEY_MANAGEMENT, TOUCH_POLICY_NEVER,
 };
 use crate::storage::{read_pinned_f9, write_pinned_f9};
 use crate::vault::{
@@ -59,6 +60,8 @@ pub struct EnrollResult {
     pub touch_policy: u8,
     pub f9_fingerprint: Option<[u8; 32]>,
     pub f9_newly_pinned: bool,
+    pub pin_is_default: bool,
+    pub puk_is_default: bool,
 }
 
 /// Enroll `password` for a local account using the first usable, policy-compliant PIV card.
@@ -115,45 +118,38 @@ pub fn enroll_with_options(opts: &EnrollOptions<'_>) -> Result<EnrollResult> {
             let card_pub = p256_public_from_sec1(&card_pub_sec1)?;
             let fingerprint = sha256(&card_pub_sec1);
 
-            // Verify `0x9D` on-card attestation against `0xF9` if supported by the card.
-            let mut f9_fingerprint = None;
-            let mut f9_newly_pinned = false;
-            if let (Some(slot_cert_der), Some(f9_cert_der)) = (
+            let pin_is_default = session
+                .get_pin_puk_metadata(KEY_REF_PIN)
+                .ok()
+                .flatten()
+                .and_then(|m| m.is_default)
+                .unwrap_or(false);
+            let puk_is_default = session
+                .get_pin_puk_metadata(KEY_REF_PUK)
+                .ok()
+                .flatten()
+                .and_then(|m| m.is_default)
+                .unwrap_or(false);
+
+            // Verify `0x9D` on-card attestation against `0xF9` if supported by the card,
+            // and NEVER allow an unattested card to bypass an already-pinned HKLM root!
+            let current_f9_opt = if let (Some(slot_cert_der), Some(f9_cert_der)) = (
                 session.attest_slot(SLOT_KEY_MANAGEMENT)?,
                 session.read_attestation_ca_cert()?,
             ) {
                 let verified =
                     verify_slot_attestation(&slot_cert_der, &f9_cert_der, &card_pub_sec1)?;
-                let current_f9 = verified.f9_public_key_fingerprint;
-                f9_fingerprint = Some(current_f9);
+                Some(verified.f9_public_key_fingerprint)
+            } else {
+                None
+            };
 
-                match opts.attestation_policy {
-                    AttestationPolicy::SelfTestOnly => {}
-                    AttestationPolicy::EnforceOrPinFirstUse => {
-                        if let Some(pinned) = read_pinned_f9()? {
-                            if !constant_time_eq(&pinned, &current_f9) {
-                                return Err(AuthError::Attestation(format!(
-                                    "card 0xF9 attestation root ({}) does not match pinned root ({}). \
-                                     If you replaced or reset your PIV smart card, run Re-pin Card Root first.",
-                                    hex::encode(current_f9),
-                                    hex::encode(pinned)
-                                )));
-                            }
-                        } else {
-                            write_pinned_f9(&current_f9)?;
-                            f9_newly_pinned = true;
-                        }
-                    }
-                    AttestationPolicy::RepinCurrentCard => {
-                        write_pinned_f9(&current_f9)?;
-                        f9_newly_pinned = true;
-                    }
-                }
-            } else if opts.attestation_policy == AttestationPolicy::RepinCurrentCard {
-                return Err(AuthError::Attestation(
-                    "connected card did not return 0x9D/0xF9 attestation certificates".into(),
-                ));
-            }
+            let (f9_fingerprint, f9_newly_pinned) = enforce_attestation_policy(
+                opts.attestation_policy,
+                current_f9_opt,
+                read_pinned_f9,
+                write_pinned_f9,
+            )?;
 
             let dek = random_key();
             let salt = random_salt();
@@ -221,6 +217,8 @@ pub fn enroll_with_options(opts: &EnrollOptions<'_>) -> Result<EnrollResult> {
                 touch_policy,
                 f9_fingerprint,
                 f9_newly_pinned,
+                pin_is_default,
+                puk_is_default,
             })
         })();
 
@@ -365,18 +363,121 @@ pub fn query_card_pin_remaining(
     Err(last_error.unwrap_or(AuthError::NoCard))
 }
 
+/// Pure policy evaluator for `0xF9` attestation pinning (unit-tested without touching HKLM).
+fn enforce_attestation_policy<FRead, FWrite>(
+    policy: AttestationPolicy,
+    current_f9: Option<[u8; 32]>,
+    read_pinned: FRead,
+    write_pinned: FWrite,
+) -> Result<(Option<[u8; 32]>, bool)>
+where
+    FRead: FnOnce() -> Result<Option<[u8; 32]>>,
+    FWrite: FnOnce(&[u8; 32]) -> Result<()>,
+{
+    match (policy, current_f9) {
+        (AttestationPolicy::SelfTestOnly, f9) => Ok((f9, false)),
+        (AttestationPolicy::EnforceOrPinFirstUse, Some(cur)) => {
+            if let Some(pinned) = read_pinned()? {
+                if !constant_time_eq(&pinned, &cur) {
+                    return Err(AuthError::Attestation(format!(
+                        "card 0xF9 attestation root ({}) does not match pinned root ({}). \
+                         If you replaced or reset your PIV smart card, run Re-pin Card Root first.",
+                        hex::encode(cur),
+                        hex::encode(pinned)
+                    )));
+                }
+                Ok((Some(cur), false))
+            } else {
+                write_pinned(&cur)?;
+                Ok((Some(cur), true))
+            }
+        }
+        (AttestationPolicy::EnforceOrPinFirstUse, None) => {
+            // CRITICAL: If this machine ALREADY has a pinned `0xF9` root, an unattested/emulated
+            // PIV card that omits `00 F9` MUST NOT bypass the machine pin!
+            if let Some(pinned) = read_pinned()? {
+                return Err(AuthError::Attestation(format!(
+                    "machine requires 0xF9 card attestation (pinned root {}), \
+                     but the connected card returned no attestation. Run --clear-attestation as Admin only if intentionally migrating to an unattested card.",
+                    hex::encode(pinned)
+                )));
+            }
+            Ok((None, false))
+        }
+        (AttestationPolicy::RepinCurrentCard, Some(cur)) => {
+            write_pinned(&cur)?;
+            Ok((Some(cur), true))
+        }
+        (AttestationPolicy::RepinCurrentCard, None) => Err(AuthError::Attestation(
+            "connected card did not return 0x9D/0xF9 attestation certificates".into(),
+        )),
+    }
+}
+
+/// Core transport-generic PUK PIN-unblock implementation (`00 2C 00 80`).
+///
+/// Security guarantees:
+/// - Verifies `expected_fingerprint` BEFORE issuing `RESET RETRY COUNTER`, so a wrong
+///   smart card is rejected immediately without consuming any PUK retry!
+/// - When `require_pin_blocked` is `true` (used on the unauthenticated Windows Lock Screen),
+///   verifies that the card's PIN retry counter is actually `0` (`BLOCKED`) before
+///   permitting `00 2C`, preventing default-PUK auth bypass or PUK-exhaustion DoS on
+///   unblocked cards!
+pub fn unblock_pin_with_transport<T: ApduTransport>(
+    transport: &T,
+    expected_fingerprint: Option<&[u8; 32]>,
+    require_pin_blocked: bool,
+    puk: &[u8],
+    new_pin: &[u8],
+) -> Result<Option<[u8; 32]>> {
+    let _ = crate::piv::pad_puk_bytes(puk)?;
+    let _ = crate::piv::pad_pin_bytes(new_pin)?;
+
+    let session = PivSession::new(transport);
+    session.select()?;
+
+    let fp_opt = match session.read_ec_public_key(SLOT_KEY_MANAGEMENT) {
+        Ok(pub_9d) => Some(sha256(&pub_9d)),
+        Err(_) if expected_fingerprint.is_none() => None,
+        Err(e) => return Err(e),
+    };
+
+    if let Some(expected) = expected_fingerprint {
+        let actual = fp_opt.ok_or(AuthError::WrongCard)?;
+        if !constant_time_eq(&actual, expected) {
+            return Err(AuthError::WrongCard);
+        }
+    }
+
+    if require_pin_blocked {
+        if let Some(pin_meta) = session.get_pin_puk_metadata(KEY_REF_PIN)? {
+            if let Some(rem) = pin_meta.remaining_retries {
+                if rem > 0 {
+                    return Err(AuthError::CardPolicy(
+                        "card PIN is not blocked; sign in with your PIN instead".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    session.reset_pin_with_puk(puk, new_pin)?;
+    Ok(fp_opt)
+}
+
 /// Unblock a PIV card's Application PIN using `puk` and set `new_pin` (`00 2C 00 80`).
 ///
 /// When `expected_fingerprint` is `Some`, only the enrolled PIV smart card matching that
 /// slot `0x9D` public-key fingerprint is targeted so PUK attempts are never sent
-/// to an unrelated smart card. Returns the slot `0x9D` fingerprint if present.
+/// to an unrelated smart card. When `require_pin_blocked` is `true`, unblocked cards
+/// are rejected before sending `00 2C`.
 pub fn unblock_card_pin(
     reader: Option<&str>,
     expected_fingerprint: Option<&[u8; 32]>,
+    require_pin_blocked: bool,
     puk: &[u8],
     new_pin: &[u8],
 ) -> Result<Option<[u8; 32]>> {
-    // Validate input lengths/charset before touching any reader.
     let _ = crate::piv::pad_puk_bytes(puk)?;
     let _ = crate::piv::pad_pin_bytes(new_pin)?;
 
@@ -403,31 +504,44 @@ pub fn unblock_card_pin(
             continue;
         }
 
-        let attempt: Result<Option<[u8; 32]>> = (|| {
-            let session = PivSession::new(&card);
-            session.select()?;
-
-            let fp_opt = match session.read_ec_public_key(SLOT_KEY_MANAGEMENT) {
-                Ok(pub_9d) => Some(sha256(&pub_9d)),
-                Err(_) if expected_fingerprint.is_none() => None,
-                Err(e) => return Err(e),
-            };
-
-            if let Some(expected) = expected_fingerprint {
-                let actual = fp_opt.ok_or(AuthError::WrongCard)?;
-                if !constant_time_eq(&actual, expected) {
-                    return Err(AuthError::WrongCard);
-                }
+        // Check PUK 60s safety cooldown INSIDE the exclusive PC/SC transaction!
+        if let Some(expected_fp) = expected_fingerprint {
+            if let Ok(Some(rem_secs)) = crate::storage::check_puk_last_attempt_cooldown(expected_fp)
+            {
+                return Err(AuthError::LastAttemptCooldown {
+                    remaining_secs: rem_secs,
+                });
             }
+        }
 
-            session.reset_pin_with_puk(puk, new_pin)?;
-            Ok(fp_opt)
-        })();
+        let attempt = unblock_pin_with_transport(
+            &card,
+            expected_fingerprint,
+            require_pin_blocked,
+            puk,
+            new_pin,
+        );
 
         match attempt {
-            Ok(fp_opt) => return Ok(fp_opt),
-            // Terminal PUK errors on the matched card must stop immediately!
-            Err(e @ AuthError::PukIncorrect(_)) | Err(e @ AuthError::PukBlocked) => return Err(e),
+            Ok(fp_opt) => {
+                if let Some(fp) = fp_opt {
+                    let _ = crate::storage::clear_puk_last_attempt_cooldown(&fp);
+                }
+                return Ok(fp_opt);
+            }
+            Err(AuthError::PukIncorrect(1)) => {
+                if let Some(expected_fp) = expected_fingerprint {
+                    let _ = crate::storage::start_puk_last_attempt_cooldown(
+                        expected_fp,
+                        crate::storage::LAST_ATTEMPT_COOLDOWN_SECS,
+                    );
+                }
+                return Err(AuthError::PukIncorrect(1));
+            }
+            // Terminal errors on the matched card must stop immediately!
+            Err(e @ AuthError::PukIncorrect(_))
+            | Err(e @ AuthError::PukBlocked)
+            | Err(e @ AuthError::CardPolicy(_)) => return Err(e),
             Err(e) => last_error = Some(e),
         }
     }
@@ -484,4 +598,46 @@ fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pinned_f9_root_rejects_unattested_and_mismatched_cards() {
+        let pinned_root = [0xAAu8; 32];
+        let other_root = [0xBBu8; 32];
+
+        // 1. Unattested card (`None`) MUST NOT bypass an already-pinned HKLM root!
+        let unattested_err = enforce_attestation_policy(
+            AttestationPolicy::EnforceOrPinFirstUse,
+            None,
+            || Ok(Some(pinned_root)),
+            |_| panic!("must not overwrite pin"),
+        )
+        .unwrap_err();
+        assert!(matches!(unattested_err, AuthError::Attestation(_)));
+
+        // 2. Different physical security key (`other_root`) is rejected!
+        let mismatch_err = enforce_attestation_policy(
+            AttestationPolicy::EnforceOrPinFirstUse,
+            Some(other_root),
+            || Ok(Some(pinned_root)),
+            |_| panic!("must not overwrite pin"),
+        )
+        .unwrap_err();
+        assert!(matches!(mismatch_err, AuthError::Attestation(_)));
+
+        // 3. Matching `0xF9` root succeeds without rewriting HKLM.
+        let (matched, newly_pinned) = enforce_attestation_policy(
+            AttestationPolicy::EnforceOrPinFirstUse,
+            Some(pinned_root),
+            || Ok(Some(pinned_root)),
+            |_| panic!("must not rewrite existing pin"),
+        )
+        .unwrap();
+        assert_eq!(matched, Some(pinned_root));
+        assert!(!newly_pinned);
+    }
 }

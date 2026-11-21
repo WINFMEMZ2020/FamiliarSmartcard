@@ -544,27 +544,20 @@ fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Record a mandatory safety cooldown (default 60s) for `card_fingerprint` when
-/// the card reaches 1 remaining PIN attempt (`63 C1`), preventing accidental
-/// rapid keypresses from locking the hardware card.
-pub fn start_last_attempt_cooldown(card_fingerprint: &[u8; 32], duration_secs: u64) -> Result<()> {
+fn start_named_cooldown(name: &str, duration_secs: u64) -> Result<()> {
     ensure_secured_vault_hierarchy()?;
     let key = create_secured_hklm_key(COOLDOWNS_SUBKEY)?;
-    let name = hex::encode(card_fingerprint);
     let capped = duration_secs.min(LAST_ATTEMPT_COOLDOWN_SECS);
     let until = unix_now_secs().saturating_add(capped);
-    write_raw_reg_binary(key.0, &name, &until.to_le_bytes())
+    write_raw_reg_binary(key.0, name, &until.to_le_bytes())
 }
 
-/// Check whether `card_fingerprint` has an active last-attempt cooldown.
-/// Returns `Ok(Some(remaining_secs))` if active, or `Ok(None)` if expired/absent.
-pub fn check_last_attempt_cooldown(card_fingerprint: &[u8; 32]) -> Result<Option<u64>> {
-    let name = hex::encode(card_fingerprint);
-    let Some(bytes) = read_raw_reg_binary(COOLDOWNS_SUBKEY, &name, 16)? else {
+fn check_named_cooldown(name: &str) -> Result<Option<u64>> {
+    let Some(bytes) = read_raw_reg_binary(COOLDOWNS_SUBKEY, name, 16)? else {
         return Ok(None);
     };
     if bytes.len() != 8 {
-        let _ = clear_last_attempt_cooldown(card_fingerprint);
+        let _ = clear_named_cooldown(name);
         return Ok(None);
     }
     let mut raw = [0u8; 8];
@@ -574,7 +567,7 @@ pub fn check_last_attempt_cooldown(card_fingerprint: &[u8; 32]) -> Result<Option
 
     match evaluate_cooldown_deadline(until, now, LAST_ATTEMPT_COOLDOWN_SECS) {
         CooldownDecision::Expired => {
-            let _ = clear_last_attempt_cooldown(card_fingerprint);
+            let _ = clear_named_cooldown(name);
             Ok(None)
         }
         CooldownDecision::Active { remaining_secs } => Ok(Some(remaining_secs)),
@@ -583,22 +576,57 @@ pub fn check_last_attempt_cooldown(card_fingerprint: &[u8; 32]) -> Result<Option
             remaining_secs,
         } => {
             if let Ok(key) = create_secured_hklm_key(COOLDOWNS_SUBKEY) {
-                let _ = write_raw_reg_binary(key.0, &name, &clamped_until_unix.to_le_bytes());
+                let _ = write_raw_reg_binary(key.0, name, &clamped_until_unix.to_le_bytes());
             }
             Ok(Some(remaining_secs))
         }
     }
 }
 
-/// Clear any active last-attempt cooldown for `card_fingerprint` (e.g. after successful
-/// PIN login or PUK unblock).
-pub fn clear_last_attempt_cooldown(card_fingerprint: &[u8; 32]) -> Result<()> {
+fn clear_named_cooldown(name: &str) -> Result<()> {
     let Ok(key) = create_secured_hklm_key(COOLDOWNS_SUBKEY) else {
         return Ok(());
     };
-    let name = hex::encode(card_fingerprint);
-    delete_reg_value_ignore_missing(key.0, &name);
+    delete_reg_value_ignore_missing(key.0, name);
     Ok(())
+}
+
+/// Record a mandatory safety cooldown (default 60s) for `card_fingerprint` when
+/// the card reaches 1 remaining PIN attempt (`63 C1`), preventing accidental
+/// rapid keypresses from locking the hardware card.
+pub fn start_last_attempt_cooldown(card_fingerprint: &[u8; 32], duration_secs: u64) -> Result<()> {
+    start_named_cooldown(&hex::encode(card_fingerprint), duration_secs)
+}
+
+/// Check whether `card_fingerprint` has an active last-attempt PIN cooldown.
+/// Returns `Ok(Some(remaining_secs))` if active, or `Ok(None)` if expired/absent.
+pub fn check_last_attempt_cooldown(card_fingerprint: &[u8; 32]) -> Result<Option<u64>> {
+    check_named_cooldown(&hex::encode(card_fingerprint))
+}
+
+/// Clear any active last-attempt PIN cooldown for `card_fingerprint`.
+pub fn clear_last_attempt_cooldown(card_fingerprint: &[u8; 32]) -> Result<()> {
+    clear_named_cooldown(&hex::encode(card_fingerprint))
+}
+
+/// Record a mandatory safety cooldown (default 60s) before the final PUK attempt (`63 C1`),
+/// protecting the PIV applet from accidental permanent PUK bricking.
+pub fn start_puk_last_attempt_cooldown(
+    card_fingerprint: &[u8; 32],
+    duration_secs: u64,
+) -> Result<()> {
+    start_named_cooldown(
+        &format!("{}_puk", hex::encode(card_fingerprint)),
+        duration_secs,
+    )
+}
+
+pub fn check_puk_last_attempt_cooldown(card_fingerprint: &[u8; 32]) -> Result<Option<u64>> {
+    check_named_cooldown(&format!("{}_puk", hex::encode(card_fingerprint)))
+}
+
+pub fn clear_puk_last_attempt_cooldown(card_fingerprint: &[u8; 32]) -> Result<()> {
+    clear_named_cooldown(&format!("{}_puk", hex::encode(card_fingerprint)))
 }
 
 #[cfg(test)]

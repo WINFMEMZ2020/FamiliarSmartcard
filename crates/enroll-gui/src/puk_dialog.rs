@@ -507,7 +507,18 @@ unsafe fn handle_unblock_pin(hwnd: HWND, st: &mut PukDialogState) {
         return;
     }
 
-    match unblock_card_pin(None, None, puk.as_bytes(), new_pin.as_bytes()) {
+    let expected_fp = scard_core::current_user()
+        .ok()
+        .and_then(|u| scard_core::storage::read_vault(&u.sid).ok().flatten())
+        .map(|v| v.card_pub_fingerprint);
+
+    match unblock_card_pin(
+        None,
+        expected_fp.as_ref(),
+        false,
+        puk.as_bytes(),
+        new_pin.as_bytes(),
+    ) {
         Ok(fp_opt) => {
             if let Some(fp) = fp_opt {
                 let _ = clear_last_attempt_cooldown(&fp);

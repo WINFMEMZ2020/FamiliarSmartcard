@@ -613,8 +613,7 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
                         self.fail(
                             ppsz_status,
                             pcpsi,
-                            "Enter your Familiar Smartcard PUK (6-8 characters; PIV default is 12345678)."
-                                .into(),
+                            "Enter your Familiar Smartcard PUK (6-8 characters).".into(),
                             CPSI_WARNING,
                         );
                     }
@@ -887,7 +886,7 @@ pub fn field_descriptor(index: u32) -> WinResult<CREDENTIAL_PROVIDER_FIELD_DESCR
         SFI_LABEL => (LABEL_NORMAL, CPFT_LARGE_TEXT),
         SFI_USERNAME => ("Username", CPFT_EDIT_TEXT),
         SFI_PIN => ("Familiar Smartcard PIN", CPFT_PASSWORD_TEXT),
-        SFI_PUK => ("Card PUK (default: 12345678)", CPFT_PASSWORD_TEXT),
+        SFI_PUK => ("Familiar Smartcard PUK", CPFT_PASSWORD_TEXT),
         SFI_NEW_PIN => ("New PIN (6-8 digits)", CPFT_PASSWORD_TEXT),
         SFI_CONFIRM_PIN => ("Confirm new PIN", CPFT_PASSWORD_TEXT),
         SFI_SUBMIT => ("Sign in", CPFT_SUBMIT_BUTTON),
@@ -975,7 +974,8 @@ fn create_smartcard_tile_bitmap() -> WinResult<HBITMAP> {
 }
 
 pub fn alloc_pwstr(value: &str) -> WinResult<PWSTR> {
-    let wide: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide: Zeroizing<Vec<u16>> =
+        Zeroizing::new(value.encode_utf16().chain(std::iter::once(0)).collect());
     let bytes = wide
         .len()
         .checked_mul(std::mem::size_of::<u16>())

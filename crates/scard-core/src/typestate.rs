@@ -14,7 +14,8 @@ use crate::crypto::{
 use crate::error::{AuthError, Result};
 use crate::pcsc::{ScardCard, ScardContext};
 use crate::piv::{
-    validate_slot_9d_policy, ApduTransport, PivSession, ALG_ECC_P256, SLOT_KEY_MANAGEMENT,
+    validate_slot_9d_policy, ApduTransport, PivSession, ALG_ECC_P256, KEY_REF_PIN,
+    SLOT_KEY_MANAGEMENT,
 };
 use crate::vault::{aad_password, aad_wrap, unpad_password, AadPasswordParams, VaultBlob};
 use zeroize::Zeroizing;
@@ -192,6 +193,18 @@ impl VaultLoaded {
 }
 
 impl<T: ApduTransport> CardConnected<T> {
+    pub fn card_fingerprint(&self) -> &[u8; 32] {
+        &self.0.vault.card_pub_fingerprint
+    }
+
+    /// Read-only query of remaining PIV PIN attempts inside the active PC/SC transaction.
+    pub fn query_pin_remaining(&self) -> Result<Option<u8>> {
+        let session = PivSession::new(&self.0.card);
+        Ok(session
+            .get_pin_puk_metadata(KEY_REF_PIN)?
+            .and_then(|m| m.remaining_retries))
+    }
+
     /// First VERIFY. Required because the PIV 9D key uses PIN policy ALWAYS.
     /// If this fails (`63 CX`), execution halts immediately so only 1 retry is consumed.
     pub fn verify_pin(self, pin: &Zeroizing<Vec<u8>>) -> Result<PinVerified<T>> {
@@ -406,26 +419,42 @@ mod tests {
 
     struct SimulatedPivCard {
         secret_key: SecretKey,
-        public_sec1: Vec<u8>,
-        pin: Vec<u8>,
+        advertised_public_sec1: Vec<u8>,
+        pin: RefCell<Vec<u8>>,
+        puk: Vec<u8>,
         remaining_retries: RefCell<u8>,
+        remaining_puk_retries: RefCell<u8>,
         pin_verified_once: RefCell<bool>,
         verify_calls: RefCell<usize>,
+        reset_retry_calls: RefCell<usize>,
         replay_override: Option<[u8; 32]>,
         pin_policy: u8,
     }
 
     impl SimulatedPivCard {
         fn new(pin: &[u8], replay_override: Option<[u8; 32]>, pin_policy: u8) -> Self {
-            let secret_key = SecretKey::from_bytes((&[0x42u8; 32]).into()).unwrap();
-            let public_sec1 = p256_public_to_sec1(&secret_key.public_key());
+            Self::with_key_byte(0x42, pin, b"87654321", replay_override, pin_policy)
+        }
+
+        fn with_key_byte(
+            seed_byte: u8,
+            pin: &[u8],
+            puk: &[u8],
+            replay_override: Option<[u8; 32]>,
+            pin_policy: u8,
+        ) -> Self {
+            let secret_key = SecretKey::from_bytes((&[seed_byte; 32]).into()).unwrap();
+            let advertised_public_sec1 = p256_public_to_sec1(&secret_key.public_key());
             Self {
                 secret_key,
-                public_sec1,
-                pin: pin.to_vec(),
+                advertised_public_sec1,
+                pin: RefCell::new(pin.to_vec()),
+                puk: puk.to_vec(),
                 remaining_retries: RefCell::new(3),
+                remaining_puk_retries: RefCell::new(3),
                 pin_verified_once: RefCell::new(false),
                 verify_calls: RefCell::new(0),
+                reset_retry_calls: RefCell::new(0),
                 replay_override,
                 pin_policy,
             }
@@ -439,13 +468,20 @@ mod tests {
                 (0x00, 0xA4) => Ok(vec![
                     0x50, 0x07, b'P', b'I', b'V', b'C', b'a', b'r', b'd', 0x90, 0x00,
                 ]),
-                // GET METADATA
+                // GET METADATA (slot 0x9D or PIN 0x80)
                 (0x00, 0xF7) => {
+                    if apdu[3] == KEY_REF_PIN {
+                        let rem = *self.remaining_retries.borrow();
+                        let mut meta = tlv(0x05, &[0x00])?;
+                        meta.extend_from_slice(&tlv(0x06, &[3, rem])?);
+                        meta.extend_from_slice(&[0x90, 0x00]);
+                        return Ok(meta);
+                    }
                     let mut meta = Vec::new();
                     meta.extend_from_slice(&tlv(0x01, &[ALG_ECC_P256])?);
                     meta.extend_from_slice(&tlv(0x02, &[self.pin_policy, TOUCH_POLICY_NEVER])?);
                     meta.extend_from_slice(&tlv(0x03, &[ORIGIN_GENERATED])?);
-                    let pk_inner = tlv(0x86, &self.public_sec1)?;
+                    let pk_inner = tlv(0x86, &self.advertised_public_sec1)?;
                     meta.extend_from_slice(&tlv(0x04, &pk_inner)?);
                     meta.extend_from_slice(&[0x90, 0x00]);
                     Ok(meta)
@@ -453,13 +489,42 @@ mod tests {
                 // VERIFY PIN
                 (0x00, 0x20) => {
                     *self.verify_calls.borrow_mut() += 1;
+                    if *self.remaining_retries.borrow() == 0 {
+                        return Ok(vec![0x69, 0x83]);
+                    }
                     let mut expected = [0xFFu8; 8];
-                    expected[..self.pin.len()].copy_from_slice(&self.pin);
+                    let cur_pin = self.pin.borrow();
+                    expected[..cur_pin.len()].copy_from_slice(&cur_pin);
                     if apdu[5..13] == expected {
+                        *self.remaining_retries.borrow_mut() = 3;
                         *self.pin_verified_once.borrow_mut() = true;
                         Ok(vec![0x90, 0x00])
                     } else {
                         let mut rem = self.remaining_retries.borrow_mut();
+                        *rem = rem.saturating_sub(1);
+                        Ok(vec![0x63, 0xC0 | *rem])
+                    }
+                }
+                // RESET RETRY COUNTER (PUK Unblock 00 2C 00 80)
+                (0x00, 0x2C) => {
+                    *self.reset_retry_calls.borrow_mut() += 1;
+                    if *self.remaining_puk_retries.borrow() == 0 {
+                        return Ok(vec![0x69, 0x83]);
+                    }
+                    let mut expected_puk = [0xFFu8; 8];
+                    expected_puk[..self.puk.len()].copy_from_slice(&self.puk);
+                    if apdu[5..13] == expected_puk {
+                        let new_pin: Vec<u8> = apdu[13..21]
+                            .iter()
+                            .copied()
+                            .take_while(|&b| b != 0xFF)
+                            .collect();
+                        *self.pin.borrow_mut() = new_pin;
+                        *self.remaining_retries.borrow_mut() = 3;
+                        *self.remaining_puk_retries.borrow_mut() = 3;
+                        Ok(vec![0x90, 0x00])
+                    } else {
+                        let mut rem = self.remaining_puk_retries.borrow_mut();
                         *rem = rem.saturating_sub(1);
                         Ok(vec![0x63, 0xC0 | *rem])
                     }
@@ -555,7 +620,7 @@ mod tests {
     #[test]
     fn full_typestate_unlock_succeeds_and_consumes_pin_twice() {
         let card = SimulatedPivCard::new(b"123456", None, PIN_POLICY_ALWAYS);
-        let vault = build_test_vault(&card.public_sec1, "2345-6789-ABCD-EFGH");
+        let vault = build_test_vault(&card.advertised_public_sec1, "2345-6789-ABCD-EFGH");
         let pin = Zeroizing::new(b"123456".to_vec());
 
         let pw = unlock_with_transport(vault, "S-1-5-21-100", "alice", "WORKSTATION", &card, &pin)
@@ -567,7 +632,7 @@ mod tests {
     #[test]
     fn wrong_pin_stops_after_first_verify_and_decrements_only_once() {
         let card = SimulatedPivCard::new(b"123456", None, PIN_POLICY_ALWAYS);
-        let vault = build_test_vault(&card.public_sec1, "secret");
+        let vault = build_test_vault(&card.advertised_public_sec1, "secret");
         let bad_pin = Zeroizing::new(b"999999".to_vec());
 
         let err = unlock_with_transport(
@@ -586,7 +651,7 @@ mod tests {
     #[test]
     fn static_replay_card_is_blocked_at_freshness_gate() {
         let card = SimulatedPivCard::new(b"123456", Some([0xAA; 32]), PIN_POLICY_ALWAYS);
-        let vault = build_test_vault(&card.public_sec1, "secret");
+        let vault = build_test_vault(&card.advertised_public_sec1, "secret");
         let pin = Zeroizing::new(b"123456".to_vec());
 
         let err = unlock_with_transport(vault, "S-1-5-21-100", "alice", "WORKSTATION", &card, &pin)
@@ -599,7 +664,7 @@ mod tests {
     #[test]
     fn all_zero_shared_secret_is_rejected() {
         let card = SimulatedPivCard::new(b"123456", Some([0x00; 32]), PIN_POLICY_ALWAYS);
-        let vault = build_test_vault(&card.public_sec1, "secret");
+        let vault = build_test_vault(&card.advertised_public_sec1, "secret");
         let pin = Zeroizing::new(b"123456".to_vec());
 
         let err = unlock_with_transport(vault, "S-1-5-21-100", "alice", "WORKSTATION", &card, &pin)
@@ -610,12 +675,111 @@ mod tests {
     #[test]
     fn card_with_pin_once_policy_is_rejected_before_verify() {
         let card = SimulatedPivCard::new(b"123456", None, crate::piv::PIN_POLICY_ONCE);
-        let vault = build_test_vault(&card.public_sec1, "secret");
+        let vault = build_test_vault(&card.advertised_public_sec1, "secret");
         let pin = Zeroizing::new(b"123456".to_vec());
 
         let err = unlock_with_transport(vault, "S-1-5-21-100", "alice", "WORKSTATION", &card, &pin)
             .unwrap_err();
         assert!(matches!(err, AuthError::CardPolicy(_)));
         assert_eq!(*card.verify_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn wrong_security_key_cannot_login_or_puk_reset_and_never_receives_pin_or_puk() {
+        let enrolled_card =
+            SimulatedPivCard::with_key_byte(0x42, b"123456", b"87654321", None, PIN_POLICY_ALWAYS);
+        let vault = build_test_vault(&enrolled_card.advertised_public_sec1, "REAL-WINDOWS-SECRET");
+
+        // 1. Different physical security key (`0x99`): rejected BEFORE `VERIFY PIN`!
+        let wrong_card =
+            SimulatedPivCard::with_key_byte(0x99, b"123456", b"12345678", None, PIN_POLICY_ALWAYS);
+        let pin = Zeroizing::new(b"123456".to_vec());
+        let login_err = unlock_with_transport(
+            vault.clone(),
+            "S-1-5-21-100",
+            "alice",
+            "WORKSTATION",
+            &wrong_card,
+            &pin,
+        )
+        .unwrap_err();
+        assert!(matches!(login_err, AuthError::WrongCard));
+        assert_eq!(
+            *wrong_card.verify_calls.borrow(),
+            0,
+            "wrong key must NEVER receive VERIFY PIN"
+        );
+
+        // 2. Wrong physical key (`0x99`, even if blocked!) attempting lock-screen PUK unblock:
+        //    rejected BEFORE `RESET RETRY COUNTER (00 2C)`!
+        *wrong_card.remaining_retries.borrow_mut() = 0;
+        let puk_err = crate::enroll::unblock_pin_with_transport(
+            &wrong_card,
+            Some(&vault.card_pub_fingerprint),
+            true,
+            b"12345678",
+            b"654321",
+        )
+        .unwrap_err();
+        assert!(matches!(puk_err, AuthError::WrongCard));
+        assert_eq!(
+            *wrong_card.reset_retry_calls.borrow(),
+            0,
+            "wrong key must NEVER receive 00 2C PUK unblock"
+        );
+
+        // 3. Even on the REAL enrolled card, if its PIN is NOT blocked (`remaining == 3`),
+        //    lock-screen PUK unblock (`require_pin_blocked = true`) is rejected before `00 2C`!
+        let unblocked_err = crate::enroll::unblock_pin_with_transport(
+            &enrolled_card,
+            Some(&vault.card_pub_fingerprint),
+            true,
+            b"87654321",
+            b"654321",
+        )
+        .unwrap_err();
+        assert!(matches!(unblocked_err, AuthError::CardPolicy(_)));
+        assert_eq!(*enrolled_card.reset_retry_calls.borrow(), 0);
+
+        // 4. Rogue card spoofing `enrolled_card`'s public key in metadata while holding `0x99` private key:
+        //    caught deterministically at `prove_freshness` ECDH anti-replay gate!
+        let mut spoof_card =
+            SimulatedPivCard::with_key_byte(0x99, b"123456", b"12345678", None, PIN_POLICY_ALWAYS);
+        spoof_card.advertised_public_sec1 = enrolled_card.advertised_public_sec1.clone();
+        let spoof_err = unlock_with_transport(
+            vault.clone(),
+            "S-1-5-21-100",
+            "alice",
+            "WORKSTATION",
+            &spoof_card,
+            &pin,
+        )
+        .unwrap_err();
+        assert!(matches!(spoof_err, AuthError::WrongCard));
+        assert_eq!(*spoof_card.verify_calls.borrow(), 1);
+
+        // 5. When the REAL enrolled card IS blocked (`remaining == 0`), PUK unblock with the
+        //    correct PUK succeeds and the new PIN unlocks the existing vault without re-enrollment!
+        *enrolled_card.remaining_retries.borrow_mut() = 0;
+        let fp = crate::enroll::unblock_pin_with_transport(
+            &enrolled_card,
+            Some(&vault.card_pub_fingerprint),
+            true,
+            b"87654321",
+            b"654321",
+        )
+        .unwrap();
+        assert_eq!(fp, Some(vault.card_pub_fingerprint));
+        let new_pin = Zeroizing::new(b"654321".to_vec());
+        let unlocked_pw = unlock_with_transport(
+            vault,
+            "S-1-5-21-100",
+            "alice",
+            "WORKSTATION",
+            &enrolled_card,
+            &new_pin,
+        )
+        .unwrap();
+        assert_eq!(unlocked_pw.as_str(), "REAL-WINDOWS-SECRET");
     }
 }
