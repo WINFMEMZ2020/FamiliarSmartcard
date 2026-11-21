@@ -92,19 +92,26 @@ pub fn enroll_with_options(opts: &EnrollOptions<'_>) -> Result<EnrollResult> {
             let session = PivSession::new(&card);
             let selected = session.select()?;
 
-            let metadata = session.get_metadata(SLOT_KEY_MANAGEMENT)?.ok_or_else(|| {
-                AuthError::CardPolicy(
-                    "card does not expose slot 0x9D metadata or slot 0x9D has no key".into(),
-                )
-            })?;
-            let parsed_meta = metadata.parse();
-            validate_slot_9d_policy(&parsed_meta)?;
-            let touch_policy = parsed_meta.touch_policy.unwrap_or(TOUCH_POLICY_NEVER);
-
-            let card_pub_sec1 = match parsed_meta.public_key_sec1 {
-                Some(pk) => pk,
-                None => session.read_ec_public_key(SLOT_KEY_MANAGEMENT)?,
-            };
+            // When the PIV card exposes `00 F7` slot metadata, enforce `ECCP256`,
+            // `PIN ALWAYS`, and `On-card` origin. On pure NIST SP 800-73-4 PIV smart cards
+            // without vendor `00 F7` metadata, fall back to the standard `5F C1 0B` X.509
+            // certificate for slot `0x9D` (matching `typestate.rs` unlock behavior).
+            let (touch_policy, card_pub_sec1) =
+                if let Some(metadata) = session.get_metadata(SLOT_KEY_MANAGEMENT)? {
+                    let parsed_meta = metadata.parse();
+                    validate_slot_9d_policy(&parsed_meta)?;
+                    let tp = parsed_meta.touch_policy.unwrap_or(TOUCH_POLICY_NEVER);
+                    let pk = match parsed_meta.public_key_sec1 {
+                        Some(pk) => pk,
+                        None => session.read_ec_public_key(SLOT_KEY_MANAGEMENT)?,
+                    };
+                    (tp, pk)
+                } else {
+                    (
+                        TOUCH_POLICY_NEVER,
+                        session.read_ec_public_key(SLOT_KEY_MANAGEMENT)?,
+                    )
+                };
             let card_pub = p256_public_from_sec1(&card_pub_sec1)?;
             let fingerprint = sha256(&card_pub_sec1);
 
@@ -127,7 +134,7 @@ pub fn enroll_with_options(opts: &EnrollOptions<'_>) -> Result<EnrollResult> {
                             if !constant_time_eq(&pinned, &current_f9) {
                                 return Err(AuthError::Attestation(format!(
                                     "card 0xF9 attestation root ({}) does not match pinned root ({}). \
-                                     If you burned OTP or replaced your RS-Key, run Re-pin Card Root first.",
+                                     If you replaced or reset your PIV smart card, run Re-pin Card Root first.",
                                     hex::encode(current_f9),
                                     hex::encode(pinned)
                                 )));
@@ -306,7 +313,7 @@ pub fn enroll(
     })
 }
 
-/// Read-only query of remaining PIV PIN attempts on the enrolled RS-Key matching
+/// Read-only query of remaining PIV PIN attempts on the enrolled PIV smart card matching
 /// `expected_fingerprint`. Leaves non-matching and matching cards undisturbed (`SCARD_LEAVE_CARD`).
 pub fn query_card_pin_remaining(
     reader: Option<&str>,
@@ -360,7 +367,7 @@ pub fn query_card_pin_remaining(
 
 /// Unblock a PIV card's Application PIN using `puk` and set `new_pin` (`00 2C 00 80`).
 ///
-/// When `expected_fingerprint` is `Some`, only the enrolled RS-Key matching that
+/// When `expected_fingerprint` is `Some`, only the enrolled PIV smart card matching that
 /// slot `0x9D` public-key fingerprint is targeted so PUK attempts are never sent
 /// to an unrelated smart card. Returns the slot `0x9D` fingerprint if present.
 pub fn unblock_card_pin(

@@ -10,7 +10,7 @@
    - No automatic retry, no auto-logon, no default credential provider.
 
 3. **No card, no password.**
-   - The vault must never contain material that can recover the Windows password without the RS-Key.
+   - The vault must never contain material that can recover the Windows password without the enrolled PIV smart card.
    - `Eph_Priv_enroll` is never persisted.
 
 4. **Freshness before unwrap.**

@@ -80,7 +80,7 @@ fn run_once() -> HelperResponse {
             return HelperResponse::Failure {
                 reason: HelperFailureReason::Generic,
                 icon: HelperIcon::Error,
-                message: "This account is not bound to an RS-Key.".into(),
+                message: "This account is not bound to Familiar Smartcard.".into(),
             };
         }
         Err(error) => {
@@ -143,7 +143,7 @@ fn handle_unlock(
                 return HelperResponse::Failure {
                     reason: HelperFailureReason::PinBlocked,
                     icon: HelperIcon::Error,
-                    message: "RS-Key PIN is blocked (0 attempts left). Enter your PUK and a new PIN to unblock and sign in.".into(),
+                    message: "Familiar Smartcard PIN is blocked (0 attempts left). Enter your PUK and a new PIN to unblock and sign in.".into(),
                 };
             }
             Ok(Some(r)) if r > 1 => {
@@ -181,7 +181,7 @@ fn handle_unlock(
                 reason: HelperFailureReason::CooldownActive,
                 icon: HelperIcon::Warning,
                 message: format!(
-                    "Incorrect RS-Key PIN — ONLY 1 ATTEMPT REMAINING before hardware lock! Waiting {LAST_ATTEMPT_COOLDOWN_SECS}s safety cooldown before your final try."
+                    "Incorrect Familiar Smartcard PIN — ONLY 1 ATTEMPT REMAINING before hardware lock! Waiting {LAST_ATTEMPT_COOLDOWN_SECS}s safety cooldown before your final try."
                 ),
             }
         }
@@ -190,7 +190,7 @@ fn handle_unlock(
             HelperResponse::Failure {
                 reason: HelperFailureReason::PinBlocked,
                 icon: HelperIcon::Error,
-                message: "RS-Key PIN is blocked (0 attempts left). Enter your PUK and a new PIN to unblock and sign in.".into(),
+                message: "Familiar Smartcard PIN is blocked (0 attempts left). Enter your PUK and a new PIN to unblock and sign in.".into(),
             }
         }
         Err(error) => HelperResponse::Failure {
@@ -217,12 +217,12 @@ fn handle_unblock_and_unlock(
             AuthError::PukIncorrect(rem) => HelperResponse::Failure {
                 reason: HelperFailureReason::PukIncorrect,
                 icon: HelperIcon::Error,
-                message: format!("Incorrect RS-Key PUK ({rem} PUK attempt(s) remaining)."),
+                message: format!("Incorrect Familiar Smartcard PUK ({rem} PUK attempt(s) remaining)."),
             },
             AuthError::PukBlocked => HelperResponse::Failure {
                 reason: HelperFailureReason::PukBlocked,
                 icon: HelperIcon::Error,
-                message: "RS-Key PUK is permanently blocked. Sign in with your Windows password and reset the PIV applet.".into(),
+                message: "Familiar Smartcard PUK is permanently blocked. Sign in with your Windows password and reset the PIV applet.".into(),
             },
             other => HelperResponse::Failure {
                 reason: HelperFailureReason::Generic,
@@ -240,7 +240,7 @@ fn handle_unblock_and_unlock(
             reason: HelperFailureReason::Generic,
             icon: icon_for_error(&error),
             message: format!(
-                "RS-Key PIN was unblocked, but completing sign-in failed: {}",
+                "Familiar Smartcard PIN was unblocked, but completing sign-in failed: {}",
                 format_user_error(&error)
             ),
         },
@@ -261,27 +261,30 @@ fn icon_for_error(error: &AuthError) -> HelperIcon {
 fn format_user_error(error: &AuthError) -> String {
     match error {
         AuthError::NoReader => {
-            "No smart card reader detected. Insert your RS-Key (or enable Smart Cards in RDP)."
+            "No smart card reader detected. Insert your Familiar Smartcard (or enable Smart Cards in RDP)."
                 .into()
         }
-        AuthError::NoCard => "No RS-Key present in reader.".into(),
+        AuthError::NoCard => "No PIV smart card present in reader.".into(),
         AuthError::CardBusy => {
-            "RS-Key is busy in another application. Close other smart-card apps and try again."
+            "Smart card is busy in another application. Close other smart-card apps and try again."
                 .into()
         }
         AuthError::Timeout => "Smart card operation timed out or was cancelled.".into(),
-        AuthError::WrongCard => "The connected key does not match the enrolled RS-Key.".into(),
+        AuthError::WrongCard => {
+            "The connected card does not match the enrolled Familiar Smartcard.".into()
+        }
         AuthError::PinIncorrect(rem) => {
-            format!("Incorrect RS-Key PIN ({rem} attempt(s) remaining).")
+            format!("Incorrect Familiar Smartcard PIN ({rem} attempt(s) remaining).")
         }
         AuthError::PinBlocked => {
-            "RS-Key PIN is blocked. Enter your PUK and a new PIN to unblock.".into()
+            "Familiar Smartcard PIN is blocked. Enter your PUK and a new PIN to unblock.".into()
         }
         AuthError::PukIncorrect(rem) => {
-            format!("Incorrect RS-Key PUK ({rem} PUK attempt(s) remaining).")
+            format!("Incorrect Familiar Smartcard PUK ({rem} PUK attempt(s) remaining).")
         }
         AuthError::PukBlocked => {
-            "RS-Key PUK is permanently blocked. Sign in with your Windows password.".into()
+            "Familiar Smartcard PUK is permanently blocked. Sign in with your Windows password."
+                .into()
         }
         AuthError::Apdu {
             sw1: 0x69,

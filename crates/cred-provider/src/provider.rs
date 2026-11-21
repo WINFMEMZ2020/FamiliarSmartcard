@@ -1,7 +1,7 @@
 //! Credential Provider implementation.
 //!
 //! Key behaviors:
-//! - Filters enumerated user tiles to ONLY accounts that have a bound RS-Key vault.
+//! - Filters enumerated user tiles to ONLY accounts that have a bound Familiar Smartcard vault.
 //! - Resolves SAM usernames authoritatively by SID (`LookupAccountSidW`) so UPNs
 //!   never corrupt AAD or `NetUserGetInfo`.
 //! - Automatically emits an `ExplicitUser` ("Other user") credential when the

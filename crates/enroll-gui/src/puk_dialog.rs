@@ -119,7 +119,7 @@ pub fn show_puk_management_dialog(parent: HWND) -> Option<String> {
 
         let _ = EnableWindow(parent, false);
 
-        let title = to_wide("RS-Key PIN Unblock & PUK Management");
+        let title = to_wide("Familiar Smartcard — PIN Unblock & PUK Management");
         let Ok(modal) = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class_name,
@@ -518,11 +518,11 @@ unsafe fn handle_unblock_pin(hwnd: HWND, st: &mut PukDialogState) {
                 scrub_hwnd(st.unblock_confirm_pin);
                 set_lbl(
                     st.status_lbl,
-                    "Success: RS-Key PIV PIN unblocked and retry counter reset to 3.",
+                    "Success: PIV PIN unblocked and retry counter reset to 3.",
                 );
                 let _ = MessageBoxW(
                     Some(hwnd),
-                    w!("RS-Key PIV PIN was unblocked and its retry counter has been restored to 3.\r\n\r\nYour existing Windows vault remains valid with the new PIN."),
+                    w!("The smart card PIV PIN was unblocked and its retry counter has been restored to 3.\r\n\r\nYour existing Windows vault remains valid with the new PIN."),
                     w!("PIN Unblocked"),
                     MB_OK | MB_ICONINFORMATION,
                 );
@@ -572,7 +572,7 @@ unsafe fn handle_change_puk(hwnd: HWND, st: &mut PukDialogState) {
     let confirm = unsafe {
         MessageBoxW(
             Some(hwnd),
-            w!("Make sure you have written down the new PUK offline before proceeding!\r\n\r\nIf you forget both your PIN and your PUK, the PIV applet on the RS-Key will have to be wiped.\r\n\r\nProceed with changing the card PUK?"),
+            w!("Make sure you have written down the new PUK offline before proceeding!\r\n\r\nIf you forget both your PIN and your PUK, the PIV applet on the smart card will have to be wiped.\r\n\r\nProceed with changing the card PUK?"),
             w!("Confirm Change Card PUK"),
             MB_YESNO | MB_ICONWARNING,
         )
@@ -587,10 +587,10 @@ unsafe fn handle_change_puk(hwnd: HWND, st: &mut PukDialogState) {
                 scrub_hwnd(st.chg_cur_puk);
                 scrub_hwnd(st.chg_new_puk);
                 scrub_hwnd(st.chg_confirm_puk);
-                set_lbl(st.status_lbl, "Success: RS-Key PUK updated.");
+                set_lbl(st.status_lbl, "Success: PIV card PUK updated.");
                 let _ = MessageBoxW(
                     Some(hwnd),
-                    w!("RS-Key PUK has been updated. Keep your new PUK stored safely offline."),
+                    w!("The smart card PUK has been updated. Keep your new PUK stored safely offline."),
                     w!("Card PUK Updated"),
                     MB_OK | MB_ICONINFORMATION,
                 );

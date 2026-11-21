@@ -1,7 +1,8 @@
-# FamiliarSmartcard
+# Familiar Smartcard
 
-Windows local-account sign-in and workstation unlock via an RS-Key PIV `0x9D`
-P-256 key and a hardened Credential Provider V2.
+Windows local-account sign-in and workstation unlock via a standard PIV
+(NIST SP 800-73-4) smart card or hardware security key (`0x9D` ECC P-256) and a
+hardened Credential Provider V2.
 
 ## Principles
 
@@ -9,10 +10,10 @@ See `PROJECT_PRINCIPLES.md`. All runtime, CLI, and UI messages are strictly Engl
 
 ## Workspace Layout
 
-- `crates/scard-core` — PC/SC, PIV APDU, `0x9D` policy & `0xF9` attestation verifier, vault format, DPAPI, SDDL ACLs, IPC framing, and Typestate pipeline.
-- `crates/auth-helper` — `familiar-auth-helper.exe`: same-session isolated PC/SC unlock helper with hard timeout protection for `LogonUI.exe`.
-- `crates/cred-provider` — `cred_provider.dll`: COM Credential Provider V2 supporting both bound user tiles and RDP "Other user" sign-in.
-- `crates/enroll-gui` — `familiar-enroll.exe`: native Win32 two-phase setup, offline recovery-sheet verification, attestation pinning, and pure-Rust installer.
+- `crates/scard-core` — PC/SC, PIV APDU (`VERIFY`, `RESET RETRY COUNTER`, `CHANGE REFERENCE DATA`, `GENERAL AUTHENTICATE` ECDH), `0x9D` policy & `0xF9` attestation verifier, vault format, DPAPI, SDDL ACLs, IPC framing, and Typestate pipeline.
+- `crates/auth-helper` — `familiar-auth-helper.exe`: same-session isolated PC/SC unlock & PUK-unblock helper with hard timeout protection and 60s last-attempt safety cooldown.
+- `crates/cred-provider` — `cred_provider.dll`: COM Credential Provider V2 supporting bound user tiles, RDP "Other user" sign-in, and in-place PUK unblock on the lock screen.
+- `crates/enroll-gui` — `familiar-enroll.exe`: native Win32 two-phase setup, offline recovery-sheet verification, PIN unblock / PUK management, attestation pinning, and pure-Rust installer.
 
 ## Build & Test
 
@@ -37,13 +38,13 @@ Release binaries in `target\release\`:
 # Stateless crypto self-test (no registry writes, no Windows password change)
 .\familiar-enroll.exe --card-selftest <PIV-PIN>
 
-# Unblock a locked PIV PIN (SW=6983) using the card PUK (factory default: 12345678) and reset retries to 3
+# Unblock a locked PIV PIN (SW=6983) using the card PUK (PIV default: 12345678) and reset retries to 3
 .\familiar-enroll.exe --unblock-pin <PUK> <NEW-PIN>
 
-# Change the card PUK (replace factory default 12345678 with your own 6-8 char PUK)
+# Change the card PUK (replace default 12345678 with your own 6-8 char PUK)
 .\familiar-enroll.exe --change-puk <CURRENT-PUK> <NEW-PUK>
 
-# Re-pin the connected card's 0xF9 attestation root in HKLM (Admin; run after `rsk otp burn` or card replacement)
+# Re-pin the connected card's 0xF9 attestation root in HKLM (Admin; run after card replacement or reset)
 .\familiar-enroll.exe --repin-attestation
 
 # Clear the pinned 0xF9 attestation root from HKLM (Admin)
@@ -55,7 +56,7 @@ Release binaries in `target\release\`:
 Launch `familiar-enroll.exe` (requests UAC elevation automatically):
 
 1. **`Set up & rotate password (Recommended)`**:
-   - Validates the local Workgroup account, verifies `0x9D` (`ECCP256`, `PIN ALWAYS`, `On-card`) and `0xF9` attestation, generates a **36-character unambiguous random password** (`XXXX-XXXX-...`), and runs a real card unlock self-test **before** changing your Windows password.
+   - Validates the local Workgroup account, verifies `0x9D` (`ECCP256`, `PIN ALWAYS`, `On-card` when metadata is exposed, or standard `5F C1 0B` X.509 certificate) and `0xF9` attestation if supported, generates a **36-character unambiguous random password** (`XXXX-XXXX-...`), and runs a real card unlock self-test **before** changing your Windows password.
    - Displays (and optionally prints via direct GDI) the offline recovery sheet and requires typing the last 6 characters to confirm.
    - Atomically rotates the local password (`UF_DONT_EXPIRE_PASSWD`), commits the verified `VaultBlob`, and installs/registers the Credential Provider and helper in `C:\Program Files\FamiliarSmartcard\`.
 2. **`Re-bind current password (Dev / Rescue — Not Recommended for Production)`**:
@@ -65,4 +66,4 @@ Launch `familiar-enroll.exe` (requests UAC elevation automatically):
 
 - Always configure a Windows Account Lockout Threshold (`net accounts /lockoutthreshold:5`).
 - Never expose RDP TCP 3389 directly to the internet or untrusted LANs when NLA (`UserAuthentication=0`) is disabled; restrict port 3389 to VPN/WireGuard/IPsec interfaces.
-- Before production use, change the default PIV PIN, PUK, and Management Key (never pass `--protect`), and complete RS-Key OTP burn + `lock-page58` + Secure Boot, then run `familiar-enroll.exe --repin-attestation` (or click `Re-pin card root`).
+- Before production use, change the default PIV PIN (`123456`), PUK (`12345678`), and Management Key on your PIV smart card or security key. If you replace or factory-reset your card, run `familiar-enroll.exe --repin-attestation` (or click `Re-pin card root`).

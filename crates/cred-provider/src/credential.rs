@@ -63,8 +63,8 @@ const SFI_STATUS: u32 = 8;
 const SFI_TOGGLE_MODE: u32 = 9;
 const FIELD_COUNT: u32 = 10;
 
-const LABEL_NORMAL: &str = "Sign in with RS-Key";
-const LABEL_UNBLOCK: &str = "Unblock RS-Key with PUK";
+const LABEL_NORMAL: &str = "Sign in with Familiar Smartcard";
+const LABEL_UNBLOCK: &str = "Unblock Familiar Smartcard with PUK";
 const LINK_TO_UNBLOCK: &str = "PIN blocked? Unblock with PUK";
 const LINK_TO_NORMAL: &str = "Back to normal PIN sign-in";
 
@@ -210,7 +210,7 @@ impl Credential_Impl {
                     CPFS_HIDDEN,
                     CPFS_DISPLAY_IN_SELECTED_TILE,
                     SFI_CONFIRM_PIN,
-                    w!("Unblock RS-Key with PUK"),
+                    w!("Unblock Familiar Smartcard with PUK"),
                     w!("Back to normal PIN sign-in"),
                 )
             } else {
@@ -218,7 +218,7 @@ impl Credential_Impl {
                     CPFS_DISPLAY_IN_SELECTED_TILE,
                     CPFS_HIDDEN,
                     SFI_PIN,
-                    w!("Sign in with RS-Key"),
+                    w!("Sign in with Familiar Smartcard"),
                     w!("PIN blocked? Unblock with PUK"),
                 )
             };
@@ -313,7 +313,7 @@ impl Credential_Impl {
                             self.fail(
                                 ppsz_status,
                                 pcpsi,
-                                "Sign-in failed. Verify the local username, RS-Key enrollment, and credentials."
+                                "Sign-in failed. Verify the local username, Familiar Smartcard enrollment, and credentials."
                                     .into(),
                                 CPSI_ERROR,
                             );
@@ -483,7 +483,7 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
             if dwfieldid != SFI_TILEIMAGE {
                 return Err(E_INVALIDARG.into());
             }
-            create_rskey_tile_bitmap()
+            create_smartcard_tile_bitmap()
         })
     }
 
@@ -613,7 +613,7 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
                         self.fail(
                             ppsz_status,
                             pcpsi,
-                            "Enter your RS-Key PUK (6-8 characters; factory default is 12345678)."
+                            "Enter your Familiar Smartcard PUK (6-8 characters; PIV default is 12345678)."
                                 .into(),
                             CPSI_WARNING,
                         );
@@ -629,7 +629,7 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
                         self.fail(
                             ppsz_status,
                             pcpsi,
-                            "RS-Key PUK must be 6-8 printable ASCII characters.".into(),
+                            "Familiar Smartcard PUK must be 6-8 printable ASCII characters.".into(),
                             CPSI_WARNING,
                         );
                     }
@@ -673,7 +673,7 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
                         self.fail(
                             ppsz_status,
                             pcpsi,
-                            "Enter your RS-Key PIN.".into(),
+                            "Enter your Familiar Smartcard PIN.".into(),
                             CPSI_WARNING,
                         );
                     }
@@ -883,11 +883,11 @@ impl IRawCredentialProviderCredential2_Impl for Credential_Impl {
 
 pub fn field_descriptor(index: u32) -> WinResult<CREDENTIAL_PROVIDER_FIELD_DESCRIPTOR> {
     let (label, cpft) = match index {
-        SFI_TILEIMAGE => ("RS-Key", CPFT_TILE_IMAGE),
+        SFI_TILEIMAGE => ("Familiar Smartcard", CPFT_TILE_IMAGE),
         SFI_LABEL => (LABEL_NORMAL, CPFT_LARGE_TEXT),
         SFI_USERNAME => ("Username", CPFT_EDIT_TEXT),
-        SFI_PIN => ("RS-Key PIN", CPFT_PASSWORD_TEXT),
-        SFI_PUK => ("RS-Key PUK (default: 12345678)", CPFT_PASSWORD_TEXT),
+        SFI_PIN => ("Familiar Smartcard PIN", CPFT_PASSWORD_TEXT),
+        SFI_PUK => ("Card PUK (default: 12345678)", CPFT_PASSWORD_TEXT),
         SFI_NEW_PIN => ("New PIN (6-8 digits)", CPFT_PASSWORD_TEXT),
         SFI_CONFIRM_PIN => ("Confirm new PIN", CPFT_PASSWORD_TEXT),
         SFI_SUBMIT => ("Sign in", CPFT_SUBMIT_BUTTON),
@@ -911,7 +911,7 @@ pub fn field_count() -> u32 {
 /// Generate a crisp 48x48 32-bpp smart-card / security-key `HBITMAP` for the
 /// Windows "Sign-in options" button. Ownership of the returned `HBITMAP` transfers
 /// to `LogonUI.exe` (`DeleteObject`).
-fn create_rskey_tile_bitmap() -> WinResult<HBITMAP> {
+fn create_smartcard_tile_bitmap() -> WinResult<HBITMAP> {
     const W: usize = 48;
     const H: usize = 48;
     let bmi = BITMAPINFO {

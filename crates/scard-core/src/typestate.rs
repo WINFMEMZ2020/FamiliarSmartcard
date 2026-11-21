@@ -437,7 +437,7 @@ mod tests {
             match (apdu[0], apdu[1]) {
                 // SELECT PIV
                 (0x00, 0xA4) => Ok(vec![
-                    0x50, 0x06, b'R', b'S', b'-', b'K', b'e', b'y', 0x90, 0x00,
+                    0x50, 0x07, b'P', b'I', b'V', b'C', b'a', b'r', b'd', 0x90, 0x00,
                 ]),
                 // GET METADATA
                 (0x00, 0xF7) => {

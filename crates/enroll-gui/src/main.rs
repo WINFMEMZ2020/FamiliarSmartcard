@@ -66,7 +66,7 @@ const ID_MANAGE_PUK: usize = 1008;
 
 const WM_WORKER_RESULT: u32 = WM_APP + 10;
 
-const WINDOW_TITLE: &str = "FamiliarSmartcard Setup & Diagnostics";
+const WINDOW_TITLE: &str = "Familiar Smartcard — Setup & Diagnostics";
 const EM_SETPASSWORDCHAR: u32 = 0x00CC;
 const PASSWORD_CHAR: usize = 0x25CF;
 
@@ -200,13 +200,13 @@ fn main() -> windows::core::Result<()> {
 
 fn print_cli_help() {
     println!(
-        "FamiliarSmartcard Setup & Diagnostics\n\n\
+        "Familiar Smartcard — PIV Smart Card Setup & Diagnostics\n\n\
          Usage:\n\
          \x20 familiar-enroll.exe                                Launch elevated Win32 setup GUI\n\
          \x20 familiar-enroll.exe --probe                        Read-only reader, PIN/PUK, 0x9D policy & 0xF9 attestation probe\n\
          \x20 familiar-enroll.exe --card-selftest [PIN]          Stateless card ECDH/AES-GCM self-test (no registry writes)\n\
          \x20 familiar-enroll.exe --unblock-pin <PUK> <NEW-PIN>  Unblock PIV PIN via PUK (00 2C 00 80) and reset retries to 3\n\
-         \x20 familiar-enroll.exe --change-puk <CUR> <NEW>       Change card PUK via 00 24 00 81 (factory default: 12345678)\n\
+         \x20 familiar-enroll.exe --change-puk <CUR> <NEW>       Change card PUK via 00 24 00 81 (PIV default: 12345678)\n\
          \x20 familiar-enroll.exe --repin-attestation            Verify & re-pin connected card's 0xF9 root in HKLM (Admin)\n\
          \x20 familiar-enroll.exe --clear-attestation            Clear pinned 0xF9 root from HKLM (Admin)\n"
     );
@@ -259,7 +259,7 @@ fn relaunch_elevated() -> windows::core::Result<()> {
             let _ = MessageBoxW(
                 None,
                 w!("Administrator rights are required to manage vaults and register the sign-in provider."),
-                w!("FamiliarSmartcard"),
+                w!("Familiar Smartcard"),
                 MB_OK | MB_ICONERROR,
             );
         }
@@ -392,7 +392,7 @@ fn unblock_pin_cli(puk_arg: &str, new_pin_arg: &str) -> windows::core::Result<()
             if let Some(fp) = fp_opt {
                 let _ = clear_last_attempt_cooldown(&fp);
             }
-            println!("Successfully unblocked RS-Key PIV PIN and restored retry counter to 3.");
+            println!("Successfully unblocked PIV PIN and restored retry counter to 3.");
             println!("Existing Windows vaults remain valid with the new PIN.");
             Ok(())
         }
@@ -410,7 +410,7 @@ fn change_puk_cli(cur_puk_arg: &str, new_puk_arg: &str) -> windows::core::Result
     let new_puk = Zeroizing::new(new_puk_arg.as_bytes().to_vec());
     match change_card_puk(None, &cur_puk, &new_puk) {
         Ok(()) => {
-            println!("Successfully updated RS-Key PIV PUK. Keep the new PUK stored offline.");
+            println!("Successfully updated PIV card PUK. Keep the new PUK stored offline.");
             Ok(())
         }
         Err(error) => {
@@ -489,7 +489,7 @@ unsafe fn create_controls(hwnd: HWND) {
         let title = create_control(
             hwnd,
             w!("STATIC"),
-            "FamiliarSmartcard — Local Account RS-Key Setup",
+            "Familiar Smartcard — Local Account PIV Setup",
             20,
             14,
             840,
@@ -501,7 +501,7 @@ unsafe fn create_controls(hwnd: HWND) {
         let subtitle = create_control(
             hwnd,
             w!("STATIC"),
-            "Recommended: generate a 36-char offline recovery password and bind it to your RS-Key PIV 9D slot.",
+            "Recommended: generate a 36-char offline recovery password and bind it to your PIV 9D smart card.",
             20,
             40,
             860,
@@ -513,7 +513,7 @@ unsafe fn create_controls(hwnd: HWND) {
         let status = create_control(
             hwnd,
             w!("STATIC"),
-            "Checking for RS-Key in background...",
+            "Checking for PIV smart card in background...",
             20,
             68,
             860,
@@ -848,15 +848,15 @@ unsafe fn spawn_probe_worker(hwnd: HWND, update_output: bool) {
         let pinned_f9 = read_pinned_f9().ok().flatten().map(hex::encode);
         let outcome = match scard_core::probe_readers() {
             Ok(readers) if readers.is_empty() => WorkerOutcome::ProbeDone {
-                status: "No RS-Key detected. Insert it (or enable Smart Cards in RDP) and click Probe card.".into(),
+                status: "No PIV smart card detected. Insert your card (or enable Smart Cards in RDP) and click Probe card.".into(),
                 output: update_output.then(|| "No smart card reader found.\r\n".into()),
             },
             Ok(readers) => {
                 let (ready, policy_err) = compliant_9d_present(&readers);
                 let status = if ready {
-                    "RS-Key detected. Slot 0x9D policy (P-256, PIN ALWAYS, On-card) is compliant.".into()
+                    "PIV smart card detected. Slot 0x9D key is ready for enrollment.".into()
                 } else if let Some(err) = policy_err {
-                    format!("RS-Key detected, but slot 0x9D failed policy check: {err}")
+                    format!("PIV smart card detected, but slot 0x9D failed policy check: {err}")
                 } else {
                     "Smart card detected, but PIV slot 0x9D has no key. Provision the card first.".into()
                 };
@@ -1107,8 +1107,9 @@ unsafe fn commit_confirmed_rotation(hwnd: HWND, prepared: PreparedRotation) {
                 post_outcome(
                     hwnd_raw,
                     WorkerOutcome::SimpleDone {
-                        status: "Setup complete. Lock the screen and sign in with your RS-Key."
-                            .into(),
+                        status:
+                            "Setup complete. Lock the screen and sign in with Familiar Smartcard."
+                                .into(),
                         output: Some(report),
                         clear_secrets: true,
                         critical_modal_error: None,
@@ -1291,7 +1292,7 @@ unsafe fn start_self_test(hwnd: HWND) {
         set_busy(
             hwnd,
             true,
-            "Running stored-vault RS-Key unlock self-test...",
+            "Running stored-vault Familiar Smartcard unlock self-test...",
         )
     };
     let hwnd_raw = hwnd.0 as isize;
@@ -1303,9 +1304,8 @@ unsafe fn start_self_test(hwnd: HWND) {
             Ok(()) => post_outcome(
                 hwnd_raw,
                 WorkerOutcome::SimpleDone {
-                    status:
-                        "Self-test succeeded: the RS-Key unlocked and verified the bound vault."
-                            .into(),
+                    status: "Self-test succeeded: Familiar Smartcard unlocked and verified the bound vault."
+                        .into(),
                     output: None,
                     clear_secrets: false,
                     critical_modal_error: None,
@@ -1334,9 +1334,9 @@ unsafe fn start_repin_card_root(hwnd: HWND) {
     let confirm = unsafe {
         MessageBoxW(
             Some(hwnd),
-            w!("Replace the machine-pinned 0xF9 attestation root with the currently connected RS-Key?\r\n\r\n\
-                Only do this after intentionally burning OTP (`rsk otp burn`, which regenerates the device attestation key) \
-                or replacing your physical RS-Key."),
+            w!("Replace the machine-pinned 0xF9 attestation root with the currently connected PIV smart card?\r\n\r\n\
+                Only do this after replacing your physical smart card, factory-resetting its PIV applet, \
+                or regenerating its device attestation key."),
             w!("Confirm Re-pin Card Attestation Root"),
             MB_YESNO | MB_ICONWARNING,
         )
@@ -1445,7 +1445,7 @@ unsafe fn handle_worker_outcome(hwnd: HWND, outcome: WorkerOutcome) {
                     let _ = MessageBoxW(
                         Some(hwnd),
                         PCWSTR(alert_w.as_ptr()),
-                        w!("FamiliarSmartcard — Action Required"),
+                        w!("Familiar Smartcard — Action Required"),
                         MB_OK | MB_ICONERROR,
                     );
                 }

@@ -1,4 +1,4 @@
-//! PIV (NIST SP 800-73-4) APDU subset and Yubico/RS-Key metadata & attestation.
+//! PIV (NIST SP 800-73-4) APDU subset and PIV metadata/attestation extensions.
 //!
 //! All commands are synchronous and must be issued inside a PC/SC transaction.
 
@@ -39,7 +39,7 @@ pub const OID_CERT_PIV_AUTH: [u8; 3] = [0x5F, 0xC1, 0x05];
 pub const OID_CERT_DIGITAL_SIGNATURE: [u8; 3] = [0x5F, 0xC1, 0x0A];
 pub const OID_CERT_KEY_MANAGEMENT: [u8; 3] = [0x5F, 0xC1, 0x0B];
 pub const OID_CERT_CARD_AUTH: [u8; 3] = [0x5F, 0xC1, 0x01];
-/// Yubico/RS-Key proprietary PIV data object holding the `0xF9` attestation certificate.
+/// PIV vendor extension data object holding the `0xF9` attestation certificate.
 pub const OID_CERT_ATTESTATION: [u8; 3] = [0x5F, 0xFF, 0x01];
 
 const MAX_CHAINING_ROUNDS: usize = 32;
@@ -78,13 +78,13 @@ pub struct SelectInfo {
     pub algorithms: Vec<u8>,
 }
 
-/// PIV metadata returned by the Yubico/RS-Key GET METADATA extension (`00 F7`).
+/// PIV metadata returned by the `GET METADATA` extension (`00 F7`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotMetadata {
     pub raw: Vec<u8>,
 }
 
-/// Parsed security attributes from Yubico/RS-Key slot metadata.
+/// Parsed security attributes from PIV slot metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotPolicy {
     pub algorithm: Option<u8>,
@@ -94,7 +94,7 @@ pub struct SlotPolicy {
     pub public_key_sec1: Option<Vec<u8>>,
 }
 
-/// Read-only PIN (`0x80`) or PUK (`0x81`) status from Yubico/RS-Key `GET METADATA`
+/// Read-only PIN (`0x80`) or PUK (`0x81`) status from `GET METADATA` (`00 F7`)
 /// (with standard NIST SP 800-73-4 empty `VERIFY` fallback for PIN).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinPukMetadata {
@@ -311,7 +311,7 @@ impl<'a, T: ApduTransport + ?Sized> PivSession<'a, T> {
         }
     }
 
-    /// Yubico/RS-Key GET METADATA (`00 F7`).
+    /// PIV `GET METADATA` extension (`00 F7`).
     /// Returns `None` if the slot has no key or the card does not implement `00 F7`.
     pub fn get_metadata(&self, slot: u8) -> Result<Option<SlotMetadata>> {
         let apdu = [0x00, 0xF7, 0x00, slot, 0x00];
@@ -326,7 +326,7 @@ impl<'a, T: ApduTransport + ?Sized> PivSession<'a, T> {
         }
     }
 
-    /// Yubico/RS-Key ATTEST (`00 F9 <slot> 00`).
+    /// PIV `ATTEST` extension (`00 F9 <slot> 00`).
     ///
     /// Note: unlike `GET METADATA` (`00 F7 00 <slot>` where `slot` is in `P2`),
     /// `ATTEST` places `slot` in `P1` and requires `P2 = 0x00` (passing `slot`
@@ -360,7 +360,7 @@ impl<'a, T: ApduTransport + ?Sized> PivSession<'a, T> {
 
     /// Read the EC public key (uncompressed 65-byte SEC1 point) for `slot`.
     ///
-    /// Prefers Yubico/RS-Key GET METADATA, then falls back to extracting the
+    /// Prefers `GET METADATA` (`00 F7`), then falls back to extracting the
     /// uncompressed P-256 point from the slot's standard PIV X.509 certificate.
     pub fn read_ec_public_key(&self, slot: u8) -> Result<Vec<u8>> {
         if let Some(metadata) = self.get_metadata(slot)? {

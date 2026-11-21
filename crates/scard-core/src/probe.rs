@@ -112,14 +112,26 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>> {
                                         policy_error: policy_err,
                                     });
                                 }
-                                Ok(None) => info.slots.push(SlotProbe {
-                                    slot,
-                                    has_key: false,
-                                    metadata_hex: String::new(),
-                                    policy: None,
-                                    policy_valid_for_9d: false,
-                                    policy_error: None,
-                                }),
+                                Ok(None) => {
+                                    // Standard PIV fallback: check whether the slot holds a standard
+                                    // PIV X.509 certificate even when vendor `00 F7` is unsupported.
+                                    let std_pk =
+                                        session.read_ec_public_key(slot).ok().filter(|pk| {
+                                            crate::crypto::p256_public_from_sec1(pk).is_ok()
+                                        });
+                                    let valid_9d = slot == SLOT_KEY_MANAGEMENT && std_pk.is_some();
+                                    if valid_9d {
+                                        pub_9d = std_pk.clone();
+                                    }
+                                    info.slots.push(SlotProbe {
+                                        slot,
+                                        has_key: std_pk.is_some(),
+                                        metadata_hex: String::new(),
+                                        policy: None,
+                                        policy_valid_for_9d: valid_9d,
+                                        policy_error: None,
+                                    });
+                                }
                                 Err(error) => {
                                     info.error = Some(error.to_string());
                                     break;

@@ -2,7 +2,7 @@
 //!
 //! Uses Windows `Crypt32` (`CertCreateCertificateContext` and
 //! `CryptVerifyCertificateSignatureEx`) so both P-256 and P-384 attestation CAs
-//! (e.g. RS-Key self-signed P-384 `0xF9` CA or YubiKey intermediate CA) are
+//! (self-signed device `0xF9` roots or intermediate attestation CAs) are
 //! verified without pulling in unverified ASN.1 parsers.
 
 #![deny(unsafe_op_in_unsafe_fn)]

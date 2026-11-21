@@ -100,7 +100,7 @@ pub fn confirm_recovery_sheet(parent: HWND, sheet: &RecoverySheet<'_>) -> bool {
         "Computer:        {}\r\n\
          Local Account:   {}\\{}\r\n\
          Account SID:     {}\r\n\
-         RS-Key Card:     {}\r\n\
+         PIV Smart Card:  {}\r\n\
          9D Fingerprint:  {}\r\n\
          Generated (UTC): {} (Unix epoch)",
         sheet.computer,
@@ -113,7 +113,7 @@ pub fn confirm_recovery_sheet(parent: HWND, sheet: &RecoverySheet<'_>) -> bool {
     );
 
     let printable_lines = vec![
-        Zeroizing::new("FAMILIARSMARTCARD EMERGENCY RECOVERY SHEET (KEEP OFFLINE)".into()),
+        Zeroizing::new("FAMILIAR SMARTCARD EMERGENCY RECOVERY SHEET (KEEP OFFLINE)".into()),
         Zeroizing::new("==========================================================".into()),
         Zeroizing::new(String::new()),
         Zeroizing::new(format!("Computer:        {}", sheet.computer)),
@@ -122,7 +122,7 @@ pub fn confirm_recovery_sheet(parent: HWND, sheet: &RecoverySheet<'_>) -> bool {
             sheet.domain, sheet.username
         )),
         Zeroizing::new(format!("Account SID:     {}", sheet.sid)),
-        Zeroizing::new(format!("RS-Key Card:     {}", sheet.card_name)),
+        Zeroizing::new(format!("PIV Smart Card:  {}", sheet.card_name)),
         Zeroizing::new(format!("9D Fingerprint:  {}", sheet.card_fingerprint_hex)),
         Zeroizing::new(format!(
             "Generated (UTC): {} (Unix seconds)",

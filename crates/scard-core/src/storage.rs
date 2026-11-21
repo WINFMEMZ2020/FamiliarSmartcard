@@ -505,7 +505,7 @@ pub fn write_pinned_f9(fingerprint: &[u8; 32]) -> Result<()> {
     write_raw_reg_binary(key.0, VALUE_PINNED_F9, fingerprint)
 }
 
-/// Clear the pinned `0xF9` attestation CA fingerprint (used after `rsk otp burn` or card replacement).
+/// Clear the pinned `0xF9` attestation CA fingerprint (used after card replacement or PIV reset).
 /// Returns `true` if a previously pinned value existed and was removed.
 pub fn clear_pinned_f9() -> Result<bool> {
     ensure_secured_vault_hierarchy()?;

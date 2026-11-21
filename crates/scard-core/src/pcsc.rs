@@ -32,8 +32,8 @@ const SCARD_E_SHARING_VIOLATION: i32 = 0x8010_000B_u32 as i32;
 const SCARD_E_CANCELLED: i32 = 0x8010_0002_u32 as i32;
 const SCARD_E_TIMEOUT: i32 = 0x8010_000A_u32 as i32;
 
-/// OpenPGP AID: selecting another applet destroys the PIV PIN verification
-/// state on RS-Key. Used only as a reset fallback when communication is alive.
+/// OpenPGP AID: selecting another applet clears transient PIV PIN verification
+/// state on multi-applet PIV smart cards. Used only as a reset fallback when communication is alive.
 const OPENPGP_AID_SELECT: [u8; 11] = [
     0x00, 0xA4, 0x04, 0x00, 0x06, 0xD2, 0x76, 0x00, 0x01, 0x24, 0x01,
 ];

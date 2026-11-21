@@ -268,7 +268,7 @@ pub fn invoke_auth_helper_at(
         }
         return generic_failure(
             HelperIcon::Warning,
-            "Smart card timed out. Check RS-Key / RDP redirection, or click Sign-in options to use your recovery password.",
+            "Smart card timed out. Check your PIV smart card / RDP redirection, or click Sign-in options to use your recovery password.",
         );
     }
     if wait_status != WAIT_OBJECT_0 {
