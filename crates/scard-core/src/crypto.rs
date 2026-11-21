@@ -4,7 +4,9 @@
 //! - HKDF-SHA256
 //! - AES-256-GCM (detached tag)
 //! - constant-time comparison
-//! - zeroization helpers
+//! - zeroization helpers and unambiguous high-entropy recovery password generator
+
+#![forbid(unsafe_code)]
 
 use crate::error::{AuthError, Result};
 use aes_gcm::aead::{AeadInPlace, KeyInit};
@@ -17,11 +19,18 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 pub const KEY_LEN: usize = 32;
 pub const NONCE_LEN: usize = 12;
 pub const TAG_LEN: usize = 16;
+
+/// 32-character unambiguous alphabet (excludes 0, O, 1, I, l).
+/// Exactly 5 bits of entropy per character with zero modulo bias (`byte & 0x1F`).
+const RECOVERY_ALPHABET: &[u8; 32] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+pub const RECOVERY_GROUPS: usize = 9;
+pub const RECOVERY_GROUP_LEN: usize = 4;
+pub const RECOVERY_CONFIRM_CHARS: usize = 6;
 
 /// Fill a fixed-size array from the OS CSPRNG.
 pub fn random_array<const N: usize>() -> [u8; N] {
@@ -31,7 +40,9 @@ pub fn random_array<const N: usize>() -> [u8; N] {
 }
 
 pub fn random_key() -> Zeroizing<[u8; KEY_LEN]> {
-    Zeroizing::new(random_array::<KEY_LEN>())
+    let mut out = Zeroizing::new([0u8; KEY_LEN]);
+    OsRng.fill_bytes(out.as_mut());
+    out
 }
 
 pub fn random_nonce() -> [u8; NONCE_LEN] {
@@ -48,6 +59,51 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Generate a 36-character grouped random password (`XXXX-XXXX-...`, 9 groups = 180 bits entropy).
+pub fn generate_recovery_password() -> Zeroizing<String> {
+    const RAW_CHARS: usize = RECOVERY_GROUPS * RECOVERY_GROUP_LEN;
+    let mut raw_bytes = Zeroizing::new([0u8; RAW_CHARS]);
+    OsRng.fill_bytes(raw_bytes.as_mut());
+
+    let cap = RAW_CHARS + (RECOVERY_GROUPS - 1);
+    let mut password = Zeroizing::new(String::with_capacity(cap));
+    for (idx, &byte) in raw_bytes.iter().enumerate() {
+        if idx > 0 && idx % RECOVERY_GROUP_LEN == 0 {
+            password.push('-');
+        }
+        let ch = RECOVERY_ALPHABET[(byte & 0x1F) as usize] as char;
+        password.push(ch);
+    }
+    password
+}
+
+/// Constant-time check that `typed_tail` matches the last `RECOVERY_CONFIRM_CHARS`
+/// non-hyphen characters of `full_password` (case-insensitive ASCII).
+pub fn verify_recovery_tail(full_password: &str, typed_tail: &str) -> bool {
+    let mut expected = Zeroizing::new(Vec::with_capacity(36));
+    for b in full_password.bytes() {
+        if b != b'-' && !b.is_ascii_whitespace() {
+            expected.push(b.to_ascii_uppercase());
+        }
+    }
+    if expected.len() < RECOVERY_CONFIRM_CHARS {
+        return false;
+    }
+
+    let mut actual = Zeroizing::new(Vec::with_capacity(16));
+    for b in typed_tail.bytes() {
+        if b != b'-' && !b.is_ascii_whitespace() {
+            actual.push(b.to_ascii_uppercase());
+        }
+    }
+    if actual.len() != RECOVERY_CONFIRM_CHARS {
+        return false;
+    }
+
+    let tail_start = expected.len() - RECOVERY_CONFIRM_CHARS;
+    constant_time_eq(&expected[tail_start..], actual.as_slice())
+}
+
 /// HKDF-SHA256 with a 32-byte output.
 pub fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]>> {
     let hk = Hkdf::<Sha256>::new(Some(salt), ikm);
@@ -58,6 +114,9 @@ pub fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8]) -> Result<Zeroizing<[u8
 }
 
 /// AES-256-GCM with a detached 16-byte tag.
+///
+/// Uses a zeroizing working buffer so an error mid-operation never leaves an
+/// unzeroized plaintext heap allocation behind.
 pub fn aes_gcm_encrypt(
     key: &[u8],
     nonce: &[u8; NONCE_LEN],
@@ -66,13 +125,14 @@ pub fn aes_gcm_encrypt(
 ) -> Result<(Vec<u8>, [u8; TAG_LEN])> {
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|_| AuthError::Crypto("invalid AES-256-GCM key length".into()))?;
-    let mut buffer = plaintext.to_vec();
+    let mut buffer = Zeroizing::new(plaintext.to_vec());
     let tag = cipher
-        .encrypt_in_place_detached(&Nonce::from(*nonce), aad, &mut buffer)
+        .encrypt_in_place_detached(&Nonce::from(*nonce), aad, buffer.as_mut())
         .map_err(|_| AuthError::Crypto("AES-256-GCM encryption failed".into()))?;
     let mut tag_bytes = [0u8; TAG_LEN];
     tag_bytes.copy_from_slice(&tag[..]);
-    Ok((buffer, tag_bytes))
+    let ciphertext = buffer.as_slice().to_vec();
+    Ok((ciphertext, tag_bytes))
 }
 
 /// AES-256-GCM authenticated decryption. Any tag/AAD mismatch is terminal.
@@ -85,11 +145,17 @@ pub fn aes_gcm_decrypt(
 ) -> Result<Zeroizing<Vec<u8>>> {
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|_| AuthError::Crypto("invalid AES-256-GCM key length".into()))?;
-    let mut buffer = ciphertext.to_vec();
-    cipher
-        .decrypt_in_place_detached(&Nonce::from(*nonce), aad, &mut buffer, &Tag::from(*tag))
-        .map_err(|_| AuthError::Crypto("AES-256-GCM authentication failed".into()))?;
-    Ok(Zeroizing::new(buffer))
+    let mut buffer = Zeroizing::new(ciphertext.to_vec());
+    if cipher
+        .decrypt_in_place_detached(&Nonce::from(*nonce), aad, buffer.as_mut(), &Tag::from(*tag))
+        .is_err()
+    {
+        buffer.zeroize();
+        return Err(AuthError::Crypto(
+            "AES-256-GCM authentication failed".into(),
+        ));
+    }
+    Ok(buffer)
 }
 
 /// Generate an ephemeral P-256 key pair.
@@ -106,9 +172,9 @@ pub fn p256_generate_ephemeral() -> (EphemeralSecret, PublicKey) {
 pub fn p256_shared_secret(secret: EphemeralSecret, peer: &PublicKey) -> Zeroizing<[u8; 32]> {
     let shared = secret.diffie_hellman(peer);
     let raw = shared.raw_secret_bytes();
-    let mut out = [0u8; 32];
+    let mut out = Zeroizing::new([0u8; 32]);
     out.copy_from_slice(&raw[..]);
-    Zeroizing::new(out)
+    out
 }
 
 pub fn p256_public_from_sec1(bytes: &[u8]) -> Result<PublicKey> {
@@ -127,10 +193,13 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).into()
 }
 
-/// Reject an all-zero ECDH result. With a valid P-256 peer this should not
-/// happen, but it is a cheap check against malformed card output.
+/// Reject an all-zero ECDH result.
 pub fn is_all_zero(bytes: &[u8]) -> bool {
-    bytes.iter().all(|byte| *byte == 0)
+    let mut acc = 0u8;
+    for &b in bytes {
+        acc |= b;
+    }
+    acc == 0
 }
 
 #[cfg(test)]
@@ -167,5 +236,19 @@ mod tests {
         let a = p256_shared_secret(s1, &p2);
         let b = p256_shared_secret(s2, &p1);
         assert_eq!(a.as_ref(), b.as_ref());
+    }
+
+    #[test]
+    fn recovery_password_format_and_tail_verification() {
+        let pw = generate_recovery_password();
+        assert_eq!(pw.len(), 44);
+        assert_eq!(pw.split('-').count(), 9);
+        assert!(!pw.contains('0') && !pw.contains('O') && !pw.contains('1') && !pw.contains('I'));
+
+        let clean: String = pw.chars().filter(|c| *c != '-').collect();
+        let last6 = &clean[clean.len() - 6..];
+        assert!(verify_recovery_tail(&pw, last6));
+        assert!(verify_recovery_tail(&pw, &last6.to_ascii_lowercase()));
+        assert!(!verify_recovery_tail(&pw, "22222"));
     }
 }

@@ -1,88 +1,62 @@
 # FamiliarSmartcard
 
-Windows local-account login/unlock via an RS-Key PIV 9D P-256 key and a
-custom Credential Provider.
+Windows local-account sign-in and workstation unlock via an RS-Key PIV `0x9D`
+P-256 key and a hardened Credential Provider V2.
 
 ## Principles
 
-See `PROJECT_PRINCIPLES.md`. All UI and runtime messages are English.
+See `PROJECT_PRINCIPLES.md`. All runtime, CLI, and UI messages are strictly English.
 
-## Layout
+## Workspace Layout
 
-- `crates/scard-core` — PC/SC, PIV APDU, vault format, DPAPI, Typestate.
-- `crates/cred-provider` — Windows Credential Provider DLL.
-- `crates/enroll-gui` — native Win32 probe/enrollment/self-test GUI.
-- `ARCHITECTURE_AND_PLAN.md` — v2.1 design.
-- `SECURITY_AUDIT.md`, `PLAN_V2_1_PATCH.md`, `PLAN_V2_1_REVIEW.md` — audits.
+- `crates/scard-core` — PC/SC, PIV APDU, `0x9D` policy & `0xF9` attestation verifier, vault format, DPAPI, SDDL ACLs, IPC framing, and Typestate pipeline.
+- `crates/auth-helper` — `familiar-auth-helper.exe`: same-session isolated PC/SC unlock helper with hard timeout protection for `LogonUI.exe`.
+- `crates/cred-provider` — `cred_provider.dll`: COM Credential Provider V2 supporting both bound user tiles and RDP "Other user" sign-in.
+- `crates/enroll-gui` — `familiar-enroll.exe`: native Win32 two-phase setup, offline recovery-sheet verification, attestation pinning, and pure-Rust installer.
 
-## Build
-
-```powershell
-cargo build --workspace
-cargo test -p scard-core
-```
-
-Headless probe (useful over RDP or in the test VM):
+## Build & Test
 
 ```powershell
-cargo run -p enroll-gui -- --probe
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo build --release --workspace
 ```
 
-Card-only crypto self-test (no registry write, no Windows password change):
+Release binaries in `target\release\`:
+
+- `cred_provider.dll` (installed as `C:\Program Files\FamiliarSmartcard\familiar_cred_provider.dll`)
+- `familiar-auth-helper.exe` (installed alongside the DLL)
+- `familiar-enroll.exe`
+
+## CLI Commands
 
 ```powershell
-cargo run -p enroll-gui -- --card-selftest <PIV-PIN>
+# Read-only probe: checks slot 0x9D policy (P-256, PIN ALWAYS, On-card) and 0xF9 attestation
+.\familiar-enroll.exe --probe
+
+# Stateless crypto self-test (no registry writes, no Windows password change)
+.\familiar-enroll.exe --card-selftest <PIV-PIN>
+
+# Re-pin the connected card's 0xF9 attestation root in HKLM (Admin; run after `rsk otp burn` or card replacement)
+.\familiar-enroll.exe --repin-attestation
+
+# Clear the pinned 0xF9 attestation root from HKLM (Admin)
+.\familiar-enroll.exe --clear-attestation
 ```
 
-Friendly enrollment GUI: double-click `familiar-enroll.exe` (the `dist` package
-is recommended). It requests UAC automatically, probes the RS-Key on startup,
-and the primary `Set up this account` button performs bind + self-test + provider
-registration in one flow. Enter the PIV PIN and the current Windows password.
+## Enrollment Workflows
 
-Release Credential Provider:
+Launch `familiar-enroll.exe` (requests UAC elevation automatically):
 
-```powershell
-cargo build --release -p cred-provider
-```
+1. **`Set up & rotate password (Recommended)`**:
+   - Validates the local Workgroup account, verifies `0x9D` (`ECCP256`, `PIN ALWAYS`, `On-card`) and `0xF9` attestation, generates a **36-character unambiguous random password** (`XXXX-XXXX-...`), and runs a real card unlock self-test **before** changing your Windows password.
+   - Displays (and optionally prints via direct GDI) the offline recovery sheet and requires typing the last 6 characters to confirm.
+   - Atomically rotates the local password (`UF_DONT_EXPIRE_PASSWD`), commits the verified `VaultBlob`, and installs/registers the Credential Provider and helper in `C:\Program Files\FamiliarSmartcard\`.
+2. **`Re-bind current password (Dev / Rescue — Not Recommended for Production)`**:
+   - Binds the existing Windows password without rotating it. **Not recommended** outside isolated test VMs or post-rescue re-binding because the native Windows password tile remains enabled; a human-chosen password can still be guessed (especially when RDP NLA is disabled).
 
-The DLL is `target\release\cred_provider.dll`.
+## Security Notes
 
-## Prerequisites
-
-1. RS-Key PIV 9D must contain an on-card P-256 key with PIN policy `ALWAYS`.
-2. `SCardSvr` must be running on the target machine.
-3. The target account must be a local Workgroup account.
-4. The GUI must be run elevated to write `HKLM`.
-
-Provisioning is complete when `Slot 0x9D: key present` appears in the probe
-output. The development card has a 9D P-256 key with PIN policy `ALWAYS` and
-touch policy `NEVER`; it still uses the **default development PIN**. Change the
-PIN/PUK/management key before any real use.
-
-## Current limitations
-
-- The GUI binds the **existing** Windows password; random-password rotation and
-  the two-phase recovery-sheet flow are not wired yet.
-- The development card uses the default PIN. Production provisioning must also
-  rotate PIN/PUK/management key, remove `--protect`, and pin `f9` attestation.
-- The Credential Provider currently uses the synchronous PC/SC path in
-  `GetSerialization`; the isolated helper/timeout process is designed in the
-  plan but not implemented yet.
-- `f9` attestation verification is not implemented in the GUI yet.
-
-## Register the Credential Provider
-
-Run an elevated PowerShell:
-
-```powershell
-.\scripts\register_cp.ps1
-```
-
-Unregister/rescue:
-
-```powershell
-.\scripts\unregister_cp.ps1
-# or import the rescue .reg file
-```
-
-Do not expose RDP port 3389 without VPN/firewall isolation when NLA is disabled.
+- Always configure a Windows Account Lockout Threshold (`net accounts /lockoutthreshold:5`).
+- Never expose RDP TCP 3389 directly to the internet or untrusted LANs when NLA (`UserAuthentication=0`) is disabled; restrict port 3389 to VPN/WireGuard/IPsec interfaces.
+- Before production use, change the default PIV PIN, PUK, and Management Key (never pass `--protect`), and complete RS-Key OTP burn + `lock-page58` + Secure Boot, then run `familiar-enroll.exe --repin-attestation` (or click `Re-pin card root`).

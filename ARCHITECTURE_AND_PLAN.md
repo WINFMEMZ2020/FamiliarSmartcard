@@ -111,7 +111,7 @@
   - Touch policy 默认 `NEVER`；高安全可选 `ALWAYS`（每次登录两次触摸；RS-Key 上 `CACHED` 等同 `ALWAYS`）
   - 禁止导入外部私钥
 - 读取 9D 公钥，校验 P-256 曲线点，保存 SHA-256 指纹。
-- 调用 `ATTEST (00 F9 00 9D)`，验证 9D 证书由当前卡 `f9` 签发，PIN policy `0x03`；**固定 `f9` CA**（它是设备首次上电自签，不是厂商根）。
+- 调用 `ATTEST (00 F9 9D 00)`（注意 `slot` 在 `P1`，`P2=00`；`0xF9` 根证书通过 `GET DATA 5FFF01` 读取），验证 9D 证书由当前卡 `f9` 签发，PIN policy `0x03`；**固定 `f9` CA**（它是设备首次上电自签，不是厂商根）。
 - 做一次 `rsk backup export`（FIDO seed；PIV/OpenPGP 不迁移）。
 
 #### 生产阶段（Phase 5）

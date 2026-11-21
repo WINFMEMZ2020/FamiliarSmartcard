@@ -38,6 +38,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "auth-helper"
+version = "0.1.0"
+dependencies = [
+ "scard-core",
+ "zeroize",
+]
+
+[[package]]
 name = "base16ct"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

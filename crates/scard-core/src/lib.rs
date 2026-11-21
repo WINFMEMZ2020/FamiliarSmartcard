@@ -1,14 +1,15 @@
 //! FamiliarSmartcard core.
 //!
-//! The core is intentionally synchronous: one authentication attempt owns one
-//! PC/SC context, one card handle, and one transaction. No background threads
-//! are created here.
+//! Synchronous cryptographic, PIV APDU, vault, account, attestation, and IPC
+//! primitives shared by `familiar-auth-helper`, `cred-provider`, and `enroll-gui`.
 
 pub mod account;
+pub mod attestation;
 pub mod crypto;
 pub mod dpapi;
 pub mod enroll;
 pub mod error;
+pub mod ipc;
 pub mod pcsc;
 pub mod piv;
 pub mod probe;
@@ -17,11 +18,14 @@ pub mod typestate;
 pub mod vault;
 
 pub use account::{current_user, UserInfo};
-pub use enroll::{enroll, EnrollResult};
+pub use enroll::{
+    enroll, enroll_with_options, repin_connected_card_attestation, AttestationPolicy,
+    EnrollOptions, EnrollResult,
+};
 pub use error::{AuthError, Result};
 pub use probe::{probe_readers, ReaderProbe, SlotProbe};
 pub use typestate::{
-    unlock, AuthPipeline, CardConnected, CredentialDecrypted, FreshnessProven, KeyUnwrapped,
-    PinVerified, PinVerifiedForUnwrap, VaultLoaded,
+    unlock, unlock_with_transport, AuthPipeline, CardConnected, CredentialDecrypted,
+    FreshnessProven, KeyUnwrapped, PinVerified, PinVerifiedForUnwrap, VaultLoaded,
 };
 pub use vault::VaultBlob;

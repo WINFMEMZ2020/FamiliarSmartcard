@@ -1,9 +1,13 @@
 //! Read-only card probing used by the enrollment GUI and diagnostics.
 
+#![forbid(unsafe_code)]
+
+use crate::attestation::verify_slot_attestation;
 use crate::error::{AuthError, Result};
 use crate::pcsc::{ScardContext, SCARD_LEAVE_CARD};
 use crate::piv::{
-    PivSession, SLOT_CARD_AUTH, SLOT_DIGITAL_SIGNATURE, SLOT_KEY_MANAGEMENT, SLOT_PIV_AUTH,
+    validate_slot_9d_policy, PivSession, SlotPolicy, SLOT_CARD_AUTH, SLOT_DIGITAL_SIGNATURE,
+    SLOT_KEY_MANAGEMENT, SLOT_PIV_AUTH,
 };
 
 #[derive(Debug, Clone)]
@@ -11,6 +15,9 @@ pub struct SlotProbe {
     pub slot: u8,
     pub has_key: bool,
     pub metadata_hex: String,
+    pub policy: Option<SlotPolicy>,
+    pub policy_valid_for_9d: bool,
+    pub policy_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -21,13 +28,16 @@ pub struct ReaderProbe {
     pub card_name: Option<String>,
     pub algorithms: Vec<u8>,
     pub slots: Vec<SlotProbe>,
+    pub f9_fingerprint_hex: Option<String>,
+    pub attestation_verified: bool,
     pub error: Option<String>,
 }
 
-/// Enumerate readers and, when a card is present, select PIV and read metadata.
+/// Enumerate readers and, when a card is present, select PIV, inspect slot
+/// policies, and verify `0x9D`/`0xF9` attestation if available.
 ///
-/// This function never writes to the card, never verifies a PIN, and never
-/// changes key material.
+/// Never writes to the card, never verifies a PIN, and leaves all cards in
+/// `SCARD_LEAVE_CARD` state.
 pub fn probe_readers() -> Result<Vec<ReaderProbe>> {
     let context = ScardContext::new()?;
     let readers = context.list_readers()?;
@@ -41,12 +51,14 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>> {
             card_name: None,
             algorithms: Vec::new(),
             slots: Vec::new(),
+            f9_fingerprint_hex: None,
+            attestation_verified: false,
             error: None,
         };
 
         match context.connect(&reader) {
             Ok(mut card) => {
-                info.atr_hex = card.atr().map(|atr| hex::encode(atr)).unwrap_or_default();
+                info.atr_hex = card.atr().map(hex::encode).unwrap_or_default();
 
                 if let Err(error) = card.begin_transaction() {
                     info.error = Some(error.to_string());
@@ -61,6 +73,8 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>> {
                         info.card_name = selected.card_name;
                         info.algorithms = selected.algorithms;
 
+                        let mut pub_9d: Option<Vec<u8>> = None;
+
                         for slot in [
                             SLOT_PIV_AUTH,
                             SLOT_DIGITAL_SIGNATURE,
@@ -68,19 +82,54 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>> {
                             SLOT_CARD_AUTH,
                         ] {
                             match session.get_metadata(slot) {
-                                Ok(Some(metadata)) => info.slots.push(SlotProbe {
-                                    slot,
-                                    has_key: true,
-                                    metadata_hex: hex::encode(metadata.raw),
-                                }),
+                                Ok(Some(metadata)) => {
+                                    let parsed = metadata.parse();
+                                    let (valid_9d, policy_err) = if slot == SLOT_KEY_MANAGEMENT {
+                                        if let Some(pk) = &parsed.public_key_sec1 {
+                                            pub_9d = Some(pk.clone());
+                                        }
+                                        match validate_slot_9d_policy(&parsed) {
+                                            Ok(()) => (true, None),
+                                            Err(e) => (false, Some(e.to_string())),
+                                        }
+                                    } else {
+                                        (false, None)
+                                    };
+                                    info.slots.push(SlotProbe {
+                                        slot,
+                                        has_key: true,
+                                        metadata_hex: hex::encode(metadata.raw),
+                                        policy: Some(parsed),
+                                        policy_valid_for_9d: valid_9d,
+                                        policy_error: policy_err,
+                                    });
+                                }
                                 Ok(None) => info.slots.push(SlotProbe {
                                     slot,
                                     has_key: false,
                                     metadata_hex: String::new(),
+                                    policy: None,
+                                    policy_valid_for_9d: false,
+                                    policy_error: None,
                                 }),
                                 Err(error) => {
                                     info.error = Some(error.to_string());
                                     break;
+                                }
+                            }
+                        }
+
+                        if let Some(pk_9d) = pub_9d {
+                            if let (Ok(Some(slot_cert)), Ok(Some(f9_cert))) = (
+                                session.attest_slot(SLOT_KEY_MANAGEMENT),
+                                session.read_attestation_ca_cert(),
+                            ) {
+                                if let Ok(verified) =
+                                    verify_slot_attestation(&slot_cert, &f9_cert, &pk_9d)
+                                {
+                                    info.attestation_verified = true;
+                                    info.f9_fingerprint_hex =
+                                        Some(hex::encode(verified.f9_public_key_fingerprint));
                                 }
                             }
                         }
@@ -91,6 +140,7 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>> {
                 }
 
                 let _ = card.end_transaction(SCARD_LEAVE_CARD);
+                let _ = card.disconnect(SCARD_LEAVE_CARD);
             }
             Err(AuthError::NoCard) | Err(AuthError::CardBusy) => {
                 info.error = Some("no card present or card busy".into());

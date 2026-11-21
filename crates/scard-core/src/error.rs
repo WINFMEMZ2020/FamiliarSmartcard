@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use thiserror::Error;
 
 /// Errors returned by the FamiliarSmartcard core.
@@ -31,6 +33,15 @@ pub enum AuthError {
     #[error("PIV slot has no key; provision the card first")]
     NoKey,
 
+    #[error("card security policy rejected: {0}")]
+    CardPolicy(String),
+
+    #[error("card attestation failed: {0}")]
+    Attestation(String),
+
+    #[error("account policy rejected: {0}")]
+    AccountPolicy(String),
+
     #[error("PIN is required")]
     PinRequired,
 
@@ -54,6 +65,9 @@ pub enum AuthError {
 
     #[error("registry error: 0x{0:08X}")]
     Registry(i32),
+
+    #[error("IPC protocol error: {0}")]
+    Ipc(String),
 
     #[error("unsupported operation: {0}")]
     Unsupported(&'static str),

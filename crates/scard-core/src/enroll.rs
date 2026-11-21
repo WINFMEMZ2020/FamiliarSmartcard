@@ -3,42 +3,66 @@
 //! Security invariants:
 //! - `Eph_Priv_enroll` exists only on the stack and is consumed by one ECDH.
 //! - Only `Eph_Pub_enroll`, the wrapped DEK, and the encrypted password are
-//!   persisted.
-//! - The card must already contain an on-card-generated 9D P-256 key.
+//!   persisted in `VaultBlob`.
+//! - Slot `0x9D` must pass `validate_slot_9d_policy` (`ECCP256`, `PIN ALWAYS`,
+//!   `On-card` origin).
+//! - When the card supports `00 F9` attestation, `0x9D` is verified against the
+//!   card's `0xF9` CA certificate and checked against (or pinned into) `HKLM`.
 
+#![forbid(unsafe_code)]
+
+use crate::attestation::verify_slot_attestation;
 use crate::crypto::{
-    aes_gcm_encrypt, hkdf_sha256, p256_generate_ephemeral, p256_public_from_sec1,
+    aes_gcm_encrypt, constant_time_eq, hkdf_sha256, p256_generate_ephemeral, p256_public_from_sec1,
     p256_public_to_sec1, p256_shared_secret, random_key, random_nonce, random_salt, sha256,
 };
 use crate::error::{AuthError, Result};
-use crate::pcsc::{ScardContext, SCARD_RESET_CARD};
-use crate::piv::{PivSession, SLOT_KEY_MANAGEMENT};
+use crate::pcsc::{ScardContext, SCARD_LEAVE_CARD};
+use crate::piv::{validate_slot_9d_policy, PivSession, SLOT_KEY_MANAGEMENT, TOUCH_POLICY_NEVER};
+use crate::storage::{read_pinned_f9, write_pinned_f9};
 use crate::vault::{
-    aad_password, aad_wrap, pad_password, VaultBlob, ALG_P256, APP_PIV, VAULT_VERSION,
+    aad_password, aad_wrap, pad_password, AadPasswordParams, VaultBlob, ALG_P256, APP_PIV,
+    VAULT_VERSION,
 };
+use zeroize::Zeroizing;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttestationPolicy {
+    /// Do not touch registry pinning (used for stateless `--card-selftest`).
+    SelfTestOnly,
+    /// Enforce existing pinned `0xF9` root if present; pin on first enrollment.
+    EnforceOrPinFirstUse,
+    /// Explicitly overwrite the pinned `0xF9` root with the connected card's `0xF9` CA.
+    RepinCurrentCard,
+}
+
+pub struct EnrollOptions<'a> {
+    pub reader: Option<&'a str>,
+    pub password: &'a str,
+    pub sid: &'a str,
+    pub username: &'a str,
+    pub computer: &'a str,
+    pub password_last_set: u64,
+    pub attestation_policy: AttestationPolicy,
+}
 
 pub struct EnrollResult {
     pub vault: VaultBlob,
+    /// Retained in `Zeroizing` memory ONLY during two-phase rotation so Phase D
+    /// can re-bind `AAD_password` after `NetUserSetInfo` without touching the card twice.
+    pub dek: Zeroizing<[u8; 32]>,
     pub card_name: Option<String>,
     pub card_pub_fingerprint: [u8; 32],
     pub card_pub_sec1: Vec<u8>,
+    pub touch_policy: u8,
+    pub f9_fingerprint: Option<[u8; 32]>,
+    pub f9_newly_pinned: bool,
 }
 
-/// Enroll `password` for a local account using the first usable PIV card.
-///
-/// The card must already have a 9D P-256 key. This function does not verify a
-/// PIN and does not generate key material on the card; provisioning is a
-/// separate, explicit step.
-pub fn enroll(
-    reader: Option<&str>,
-    password: &str,
-    sid: &str,
-    username: &str,
-    computer: &str,
-    password_last_set: u64,
-) -> Result<EnrollResult> {
+/// Enroll `password` for a local account using the first usable, policy-compliant PIV card.
+pub fn enroll_with_options(opts: &EnrollOptions<'_>) -> Result<EnrollResult> {
     let context = ScardContext::new()?;
-    let readers = match reader {
+    let readers = match opts.reader {
         Some(reader) => vec![reader.to_string()],
         None => context.list_readers()?,
     };
@@ -62,101 +86,222 @@ pub fn enroll(
             continue;
         }
 
-        let session = PivSession::new(&card);
-        let selected = match session.select() {
-            Ok(selected) => selected,
+        let attempt: Result<EnrollResult> = (|| {
+            let session = PivSession::new(&card);
+            let selected = session.select()?;
+
+            let metadata = session.get_metadata(SLOT_KEY_MANAGEMENT)?.ok_or_else(|| {
+                AuthError::CardPolicy(
+                    "card does not expose slot 0x9D metadata or slot 0x9D has no key".into(),
+                )
+            })?;
+            let parsed_meta = metadata.parse();
+            validate_slot_9d_policy(&parsed_meta)?;
+            let touch_policy = parsed_meta.touch_policy.unwrap_or(TOUCH_POLICY_NEVER);
+
+            let card_pub_sec1 = match parsed_meta.public_key_sec1 {
+                Some(pk) => pk,
+                None => session.read_ec_public_key(SLOT_KEY_MANAGEMENT)?,
+            };
+            let card_pub = p256_public_from_sec1(&card_pub_sec1)?;
+            let fingerprint = sha256(&card_pub_sec1);
+
+            // Verify `0x9D` on-card attestation against `0xF9` if supported by the card.
+            let mut f9_fingerprint = None;
+            let mut f9_newly_pinned = false;
+            if let (Some(slot_cert_der), Some(f9_cert_der)) = (
+                session.attest_slot(SLOT_KEY_MANAGEMENT)?,
+                session.read_attestation_ca_cert()?,
+            ) {
+                let verified =
+                    verify_slot_attestation(&slot_cert_der, &f9_cert_der, &card_pub_sec1)?;
+                let current_f9 = verified.f9_public_key_fingerprint;
+                f9_fingerprint = Some(current_f9);
+
+                match opts.attestation_policy {
+                    AttestationPolicy::SelfTestOnly => {}
+                    AttestationPolicy::EnforceOrPinFirstUse => {
+                        if let Some(pinned) = read_pinned_f9()? {
+                            if !constant_time_eq(&pinned, &current_f9) {
+                                return Err(AuthError::Attestation(format!(
+                                    "card 0xF9 attestation root ({}) does not match pinned root ({}). \
+                                     If you burned OTP or replaced your RS-Key, run Re-pin Card Root first.",
+                                    hex::encode(current_f9),
+                                    hex::encode(pinned)
+                                )));
+                            }
+                        } else {
+                            write_pinned_f9(&current_f9)?;
+                            f9_newly_pinned = true;
+                        }
+                    }
+                    AttestationPolicy::RepinCurrentCard => {
+                        write_pinned_f9(&current_f9)?;
+                        f9_newly_pinned = true;
+                    }
+                }
+            } else if opts.attestation_policy == AttestationPolicy::RepinCurrentCard {
+                return Err(AuthError::Attestation(
+                    "connected card did not return 0x9D/0xF9 attestation certificates".into(),
+                ));
+            }
+
+            let dek = random_key();
+            let salt = random_salt();
+            let nonce = random_nonce();
+            let wrap_nonce = random_nonce();
+
+            let padded_password = pad_password(opts.password)?;
+            let password_aad = aad_password(&AadPasswordParams {
+                version: VAULT_VERSION,
+                app: APP_PIV,
+                slot: SLOT_KEY_MANAGEMENT,
+                alg: ALG_P256,
+                fingerprint: &fingerprint,
+                sid: opts.sid,
+                username: opts.username,
+                computer: opts.computer,
+                password_last_set: opts.password_last_set,
+            });
+            let (ciphertext, tag) = aes_gcm_encrypt(
+                dek.as_ref(),
+                &nonce,
+                padded_password.as_ref(),
+                &password_aad,
+            )?;
+
+            let (ephemeral_secret, ephemeral_public) = p256_generate_ephemeral();
+            let ephemeral_public_sec1 = p256_public_to_sec1(&ephemeral_public);
+            let shared = p256_shared_secret(ephemeral_secret, &card_pub);
+            let kek = hkdf_sha256(shared.as_ref(), &salt, b"FamiliarSmartcard/v1/wrap")?;
+            let wrap_aad = aad_wrap(
+                VAULT_VERSION,
+                APP_PIV,
+                SLOT_KEY_MANAGEMENT,
+                ALG_P256,
+                &fingerprint,
+                opts.sid,
+            );
+            let (wrapped_dek, wrap_tag) =
+                aes_gcm_encrypt(kek.as_ref(), &wrap_nonce, dek.as_ref(), &wrap_aad)?;
+
+            let vault = VaultBlob {
+                version: VAULT_VERSION,
+                app: APP_PIV,
+                slot: SLOT_KEY_MANAGEMENT,
+                alg: ALG_P256,
+                card_pub_fingerprint: fingerprint,
+                eph_pub_enroll: ephemeral_public_sec1,
+                wrapped_dek,
+                wrap_nonce,
+                wrap_tag,
+                salt,
+                nonce,
+                ciphertext,
+                tag,
+                password_last_set: opts.password_last_set,
+                created_at: unix_now(),
+            };
+
+            Ok(EnrollResult {
+                vault,
+                dek,
+                card_name: selected.card_name,
+                card_pub_fingerprint: fingerprint,
+                card_pub_sec1,
+                touch_policy,
+                f9_fingerprint,
+                f9_newly_pinned,
+            })
+        })();
+
+        match attempt {
+            Ok(result) => {
+                // Enrollment did not verify a PIN; leave card undisturbed.
+                let _ = card.end_transaction(SCARD_LEAVE_CARD);
+                let _ = card.disconnect(SCARD_LEAVE_CARD);
+                return Ok(result);
+            }
             Err(error) => {
                 last_error = Some(error);
-                continue;
             }
-        };
-
-        let card_pub_sec1 = match session.read_ec_public_key(SLOT_KEY_MANAGEMENT) {
-            Ok(public_key) => public_key,
-            Err(error) => {
-                last_error = Some(error);
-                continue;
-            }
-        };
-
-        let card_pub = match p256_public_from_sec1(&card_pub_sec1) {
-            Ok(public_key) => public_key,
-            Err(error) => {
-                last_error = Some(error);
-                continue;
-            }
-        };
-
-        let fingerprint = sha256(&card_pub_sec1);
-
-        // Encrypt the Windows password under a random DEK.
-        let dek = random_key();
-        let salt = random_salt();
-        let nonce = random_nonce();
-        let wrap_nonce = random_nonce();
-
-        let padded_password = pad_password(password)?;
-        let password_aad = aad_password(
-            VAULT_VERSION,
-            APP_PIV,
-            SLOT_KEY_MANAGEMENT,
-            ALG_P256,
-            &fingerprint,
-            sid,
-            username,
-            computer,
-            password_last_set,
-        );
-        let (ciphertext, tag) =
-            aes_gcm_encrypt(dek.as_ref(), &nonce, &padded_password, &password_aad)?;
-
-        // Wrap the DEK under a KEK derived from the card public key.
-        let (ephemeral_secret, ephemeral_public) = p256_generate_ephemeral();
-        let ephemeral_public_sec1 = p256_public_to_sec1(&ephemeral_public);
-        let shared = p256_shared_secret(ephemeral_secret, &card_pub);
-        let kek = hkdf_sha256(shared.as_ref(), &salt, b"FamiliarSmartcard/v1/wrap")?;
-        let wrap_aad = aad_wrap(
-            VAULT_VERSION,
-            APP_PIV,
-            SLOT_KEY_MANAGEMENT,
-            ALG_P256,
-            &fingerprint,
-            sid,
-        );
-        let (wrapped_dek, wrap_tag) =
-            aes_gcm_encrypt(kek.as_ref(), &wrap_nonce, dek.as_ref(), &wrap_aad)?;
-
-        let vault = VaultBlob {
-            version: VAULT_VERSION,
-            app: APP_PIV,
-            slot: SLOT_KEY_MANAGEMENT,
-            alg: ALG_P256,
-            card_pub_fingerprint: fingerprint,
-            eph_pub_enroll: ephemeral_public_sec1,
-            wrapped_dek,
-            wrap_nonce,
-            wrap_tag,
-            salt,
-            nonce,
-            ciphertext,
-            tag,
-            password_last_set,
-            created_at: unix_now(),
-        };
-
-        drop(session);
-        let _ = card.end_transaction(SCARD_RESET_CARD);
-        let _ = card.disconnect(SCARD_RESET_CARD);
-
-        return Ok(EnrollResult {
-            vault,
-            card_name: selected.card_name,
-            card_pub_fingerprint: fingerprint,
-            card_pub_sec1,
-        });
+        }
     }
 
     Err(last_error.unwrap_or(AuthError::NoCard))
+}
+
+/// Probe the connected card's `0x9D`/`0xF9` attestation chain and pin its `0xF9`
+/// public-key fingerprint in `HKLM` without altering any user vault.
+pub fn repin_connected_card_attestation(reader: Option<&str>) -> Result<[u8; 32]> {
+    let context = ScardContext::new()?;
+    let readers = match reader {
+        Some(r) => vec![r.to_string()],
+        None => context.list_readers()?,
+    };
+    if readers.is_empty() {
+        return Err(AuthError::NoReader);
+    }
+
+    let mut last_error = None;
+    for reader_name in readers {
+        let mut card = match context.connect(&reader_name) {
+            Ok(c) => c,
+            Err(e) => {
+                last_error = Some(e);
+                continue;
+            }
+        };
+        if let Err(e) = card.begin_transaction() {
+            last_error = Some(e);
+            continue;
+        }
+        let check: Result<[u8; 32]> = (|| {
+            let session = PivSession::new(&card);
+            session.select()?;
+            let pub_9d = session.read_ec_public_key(SLOT_KEY_MANAGEMENT)?;
+            let slot_cert = session.attest_slot(SLOT_KEY_MANAGEMENT)?.ok_or_else(|| {
+                AuthError::Attestation("card did not return a slot 0x9D attestation cert".into())
+            })?;
+            let f9_cert = session.read_attestation_ca_cert()?.ok_or_else(|| {
+                AuthError::Attestation("card did not return a slot 0xF9 attestation CA cert".into())
+            })?;
+            let verified = verify_slot_attestation(&slot_cert, &f9_cert, &pub_9d)?;
+            write_pinned_f9(&verified.f9_public_key_fingerprint)?;
+            Ok(verified.f9_public_key_fingerprint)
+        })();
+
+        match check {
+            Ok(fp) => {
+                let _ = card.end_transaction(SCARD_LEAVE_CARD);
+                let _ = card.disconnect(SCARD_LEAVE_CARD);
+                return Ok(fp);
+            }
+            Err(e) => last_error = Some(e),
+        }
+    }
+
+    Err(last_error.unwrap_or(AuthError::NoCard))
+}
+
+/// Backwards-compatible enrollment helper (used by `--card-selftest` or default policy).
+pub fn enroll(
+    reader: Option<&str>,
+    password: &str,
+    sid: &str,
+    username: &str,
+    computer: &str,
+    password_last_set: u64,
+) -> Result<EnrollResult> {
+    enroll_with_options(&EnrollOptions {
+        reader,
+        password,
+        sid,
+        username,
+        computer,
+        password_last_set,
+        attestation_policy: AttestationPolicy::SelfTestOnly,
+    })
 }
 
 fn unix_now() -> u64 {

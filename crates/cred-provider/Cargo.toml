@@ -7,7 +7,7 @@ license.workspace = true
 description = "FamiliarSmartcard Windows Credential Provider"
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib"]
 
 [dependencies]
 windows.workspace = true

@@ -1,14 +1,33 @@
-//! Friendly native Win32 setup and diagnostics for FamiliarSmartcard.
+//! Native Win32 setup, two-phase recovery-password rotation, attestation
+//! management, and diagnostics for FamiliarSmartcard.
 //!
-//! Double-clicking the executable requests elevation (UAC), auto-detects the
-//! RS-Key, and the primary button performs the whole flow:
-//! detect card -> validate password -> bind vault -> self-test -> register CP.
-//!
-//! All user-visible strings are English by project policy.
+//! All user-visible strings (GUI and CLI) are strictly English per project policy.
 
+#![deny(unsafe_op_in_unsafe_fn)]
+
+mod installer;
+mod recovery;
+
+use recovery::{confirm_recovery_sheet, RecoverySheet};
+use scard_core::account::{
+    password_last_set, rotate_local_password_and_disable_expiry, verify_local_workgroup_account,
+    UserInfo,
+};
+use scard_core::crypto::generate_recovery_password;
+use scard_core::enroll::{
+    enroll_with_options, repin_connected_card_attestation, AttestationPolicy, EnrollOptions,
+};
+use scard_core::piv::{
+    ORIGIN_GENERATED, ORIGIN_IMPORTED, PIN_POLICY_ALWAYS, PIN_POLICY_NEVER, PIN_POLICY_ONCE,
+    TOUCH_POLICY_ALWAYS, TOUCH_POLICY_CACHED, TOUCH_POLICY_NEVER,
+};
+use scard_core::storage::{
+    clear_pinned_f9, read_pinned_f9, read_vault, stage_pending_vault_with_backup,
+    write_touch_policy, write_vault,
+};
+use scard_core::VaultBlob;
 use std::ffi::c_void;
 use std::mem::size_of;
-use std::process::Command;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -20,25 +39,31 @@ use windows::Win32::Security::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowLongPtrW,
-    GetWindowTextLengthW, GetWindowTextW, LoadCursorW, LoadIconW, MessageBoxW, PostQuitMessage,
-    RegisterClassW, SendMessageW, SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage,
-    CW_USEDEFAULT, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, GWLP_USERDATA, HMENU, IDC_ARROW,
-    IDI_APPLICATION, MB_ICONERROR, MB_OK, MSG, SW_SHOW, SW_SHOWNORMAL, WINDOW_EX_STYLE, WM_COMMAND,
-    WM_CREATE, WM_DESTROY, WM_SETFONT, WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW,
-    WS_VISIBLE, WS_VSCROLL,
+    GetWindowTextLengthW, GetWindowTextW, LoadCursorW, LoadIconW, MessageBoxW, PostMessageW,
+    PostQuitMessage, RegisterClassW, SendMessageW, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
+    TranslateMessage, CW_USEDEFAULT, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, GWLP_USERDATA,
+    HMENU, IDC_ARROW, IDI_APPLICATION, MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_YESNO, MSG, SW_SHOW,
+    SW_SHOWNORMAL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY,
+    WM_SETFONT, WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    WS_VSCROLL,
 };
 use zeroize::Zeroizing;
 
-const ID_SETUP: usize = 1001;
-const ID_PROBE: usize = 1002;
-const ID_SELFTEST: usize = 1003;
-const ID_REGISTER: usize = 1004;
-const ID_CLEAR: usize = 1005;
+const ID_SETUP_ROTATE: usize = 1001;
+const ID_REBIND_EXISTING: usize = 1002;
+const ID_PROBE: usize = 1003;
+const ID_SELFTEST: usize = 1004;
+const ID_REPIN_ROOT: usize = 1005;
+const ID_REGISTER: usize = 1006;
+const ID_CLEAR: usize = 1007;
 
-const WINDOW_TITLE: &str = "FamiliarSmartcard";
+const WM_WORKER_RESULT: u32 = WM_APP + 10;
+
+const WINDOW_TITLE: &str = "FamiliarSmartcard Setup & Diagnostics";
 const EM_SETPASSWORDCHAR: u32 = 0x00CC;
 const PASSWORD_CHAR: usize = 0x25CF;
 
@@ -47,22 +72,66 @@ struct AppState {
     output: HWND,
     pin: HWND,
     password: HWND,
+    buttons: [HWND; 7],
+    busy: bool,
+}
+
+struct PreparedRotation {
+    user: UserInfo,
+    lockout_threshold: u32,
+    new_password: Zeroizing<String>,
+    dek: Zeroizing<[u8; 32]>,
+    candidate_vault: VaultBlob,
+    card_name: String,
+    fingerprint_hex: String,
+    f9_status: String,
+    touch_policy: u8,
+}
+
+enum WorkerOutcome {
+    ProbeDone {
+        status: String,
+        output: Option<String>,
+    },
+    SimpleDone {
+        status: String,
+        output: Option<String>,
+        clear_secrets: bool,
+        critical_modal_error: Option<String>,
+    },
+    RotationCandidateReady(Box<PreparedRotation>),
 }
 
 fn main() -> windows::core::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|argument| argument == "--probe") {
-        return probe_cli();
-    }
-    if args.get(1).map(String::as_str) == Some("--card-selftest") {
-        let pin = args.get(2).map(String::as_str).unwrap_or("123456");
-        return card_selftest(pin);
+    if let Some(flag) = args.get(1).map(String::as_str) {
+        match flag {
+            "--help" | "-h" => {
+                print_cli_help();
+                return Ok(());
+            }
+            "--probe" => return probe_cli(),
+            "--card-selftest" => {
+                let pin = args.get(2).map(String::as_str).unwrap_or("123456");
+                return card_selftest_cli(pin);
+            }
+            "--repin-attestation" => return repin_attestation_cli(),
+            "--clear-attestation" => return clear_attestation_cli(),
+            _ => {
+                eprintln!("Unknown option: {flag}\n");
+                print_cli_help();
+                return Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_INVALIDARG,
+                ));
+            }
+        }
     }
 
     if !is_elevated() {
         return relaunch_elevated();
     }
 
+    // SAFETY: Standard Win32 GUI initialization and message loop.
     unsafe {
         let instance = GetModuleHandleW(None)?;
         let hinstance = HINSTANCE(instance.0);
@@ -89,8 +158,8 @@ fn main() -> windows::core::Result<()> {
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            860,
-            700,
+            920,
+            730,
             None,
             None,
             Some(hinstance),
@@ -108,7 +177,20 @@ fn main() -> windows::core::Result<()> {
     Ok(())
 }
 
+fn print_cli_help() {
+    println!(
+        "FamiliarSmartcard Setup & Diagnostics\n\n\
+         Usage:\n\
+         \x20 familiar-enroll.exe                        Launch elevated Win32 setup GUI\n\
+         \x20 familiar-enroll.exe --probe                Read-only reader, 0x9D policy & 0xF9 attestation probe\n\
+         \x20 familiar-enroll.exe --card-selftest [PIN]  Stateless card ECDH/AES-GCM self-test (no registry writes)\n\
+         \x20 familiar-enroll.exe --repin-attestation    Verify & re-pin connected card's 0xF9 root in HKLM (Admin)\n\
+         \x20 familiar-enroll.exe --clear-attestation    Clear pinned 0xF9 root from HKLM (Admin)\n"
+    );
+}
+
 fn is_elevated() -> bool {
+    // SAFETY: Queries process elevation token status and closes token handle.
     unsafe {
         let mut token = HANDLE::default();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
@@ -137,6 +219,7 @@ fn relaunch_elevated() -> windows::core::Result<()> {
         )
     })?;
     let exe_w = to_wide(&exe.to_string_lossy());
+    // SAFETY: Requests UAC elevation via `ShellExecuteW("runas")`.
     let result = unsafe {
         ShellExecuteW(
             None,
@@ -148,10 +231,11 @@ fn relaunch_elevated() -> windows::core::Result<()> {
         )
     };
     if result.0 as isize <= 32 {
+        // SAFETY: Displays standard Win32 error box.
         unsafe {
             let _ = MessageBoxW(
                 None,
-                w!("Administrator rights are required to bind the account and register the provider."),
+                w!("Administrator rights are required to manage vaults and register the sign-in provider."),
                 w!("FamiliarSmartcard"),
                 MB_OK | MB_ICONERROR,
             );
@@ -161,9 +245,10 @@ fn relaunch_elevated() -> windows::core::Result<()> {
 }
 
 fn probe_cli() -> windows::core::Result<()> {
+    let pinned_f9 = read_pinned_f9().ok().flatten().map(hex::encode);
     match scard_core::probe_readers() {
         Ok(readers) if readers.is_empty() => println!("No smart card reader found."),
-        Ok(readers) => print!("{}", format_readers(&readers)),
+        Ok(readers) => print!("{}", format_readers(&readers, pinned_f9.as_deref())),
         Err(error) => {
             eprintln!("Probe failed: {error}");
             return Err(windows::core::Error::from_hresult(
@@ -174,7 +259,14 @@ fn probe_cli() -> windows::core::Result<()> {
     Ok(())
 }
 
-fn card_selftest(pin: &str) -> windows::core::Result<()> {
+fn card_selftest_cli(pin: &str) -> windows::core::Result<()> {
+    if !valid_pin(pin) {
+        eprintln!("Invalid PIN format: PIV PIN must be 6-8 ASCII digits.");
+        return Err(windows::core::Error::from_hresult(
+            windows::Win32::Foundation::E_INVALIDARG,
+        ));
+    }
+
     const TEST_PASSWORD: &str = "FamiliarSmartcard-SelfTest-Only";
     const TEST_SID: &str = "S-1-5-21-0";
     const TEST_USER: &str = "selftest";
@@ -182,10 +274,8 @@ fn card_selftest(pin: &str) -> windows::core::Result<()> {
 
     let enrolled = scard_core::enroll(None, TEST_PASSWORD, TEST_SID, TEST_USER, TEST_COMPUTER, 0)
         .map_err(|error| {
-        windows::core::Error::new(
-            windows::Win32::Foundation::E_FAIL,
-            format!("Enrollment self-test failed: {error}"),
-        )
+        eprintln!("Enrollment self-test failed: {error}");
+        windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL)
     })?;
 
     let mut pin_bytes = Zeroizing::new(pin.as_bytes().to_vec());
@@ -198,59 +288,120 @@ fn card_selftest(pin: &str) -> windows::core::Result<()> {
         &mut pin_bytes,
     )
     .map_err(|error| {
-        windows::core::Error::new(
-            windows::Win32::Foundation::E_FAIL,
-            format!("Unlock self-test failed: {error}"),
-        )
+        eprintln!("Unlock self-test failed: {error}");
+        windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL)
     })?;
 
     if decrypted.as_str() != TEST_PASSWORD {
-        return Err(windows::core::Error::new(
+        eprintln!("Card self-test decrypted an unexpected password.");
+        return Err(windows::core::Error::from_hresult(
             windows::Win32::Foundation::E_FAIL,
-            "Card self-test decrypted an unexpected password.",
         ));
     }
 
     println!("Card self-test succeeded.");
     println!(
-        "Fingerprint: {}",
+        "9D Fingerprint: {}",
         hex::encode(enrolled.card_pub_fingerprint)
     );
+    if let Some(f9) = enrolled.f9_fingerprint {
+        println!("0xF9 Root:      {} (verified)", hex::encode(f9));
+    }
     println!(
-        "Card: {}",
+        "Card:           {}",
         enrolled.card_name.as_deref().unwrap_or("(unknown)")
     );
     Ok(())
 }
 
+fn repin_attestation_cli() -> windows::core::Result<()> {
+    if !is_elevated() {
+        eprintln!("Administrator privileges are required to update HKLM attestation pinning.");
+        return Err(windows::core::Error::from_hresult(
+            windows::Win32::Foundation::E_ACCESSDENIED,
+        ));
+    }
+    match repin_connected_card_attestation(None) {
+        Ok(fp) => {
+            println!("Successfully verified 0x9D/0xF9 attestation and pinned new card root:");
+            println!("  Pinned 0xF9 SHA-256: {}", hex::encode(fp));
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!("Re-pin attestation failed: {error}");
+            Err(windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_FAIL,
+            ))
+        }
+    }
+}
+
+fn clear_attestation_cli() -> windows::core::Result<()> {
+    if !is_elevated() {
+        eprintln!("Administrator privileges are required to clear HKLM attestation pinning.");
+        return Err(windows::core::Error::from_hresult(
+            windows::Win32::Foundation::E_ACCESSDENIED,
+        ));
+    }
+    match clear_pinned_f9() {
+        Ok(true) => {
+            println!("Cleared previously pinned 0xF9 attestation root from HKLM.");
+            Ok(())
+        }
+        Ok(false) => {
+            println!("No pinned 0xF9 attestation root was present in HKLM.");
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!("Clear attestation failed: {error}");
+            Err(windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_FAIL,
+            ))
+        }
+    }
+}
+
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // SAFETY: Main Win32 window procedure.
     unsafe {
         match msg {
             WM_CREATE => {
                 create_controls(hwnd);
-                auto_probe(hwnd);
+                spawn_probe_worker(hwnd, false);
                 LRESULT(0)
             }
             WM_COMMAND => {
-                let id = (wparam.0 & 0xFFFF) as usize;
+                let id = wparam.0 & 0xFFFF;
                 match id {
-                    ID_SETUP => setup_account(hwnd),
-                    ID_PROBE => probe_and_show(hwnd),
-                    ID_SELFTEST => self_test(hwnd),
-                    ID_REGISTER => register_provider(hwnd),
+                    ID_SETUP_ROTATE => start_setup_with_rotation(hwnd),
+                    ID_REBIND_EXISTING => start_rebind_existing_password(hwnd),
+                    ID_PROBE => spawn_probe_worker(hwnd, true),
+                    ID_SELFTEST => start_self_test(hwnd),
+                    ID_REPIN_ROOT => start_repin_card_root(hwnd),
+                    ID_REGISTER => start_register_provider(hwnd),
                     ID_CLEAR => {
-                        if let Some(state) = state(hwnd) {
-                            let _ = SetWindowTextW(state.output, PCWSTR::null());
+                        if let Some(st) = state_mut(hwnd) {
+                            let _ = SetWindowTextW(st.output, PCWSTR::null());
                         }
                     }
                     _ => {}
                 }
                 LRESULT(0)
             }
+            WM_WORKER_RESULT => {
+                let ptr = lparam.0 as *mut WorkerOutcome;
+                if !ptr.is_null() {
+                    let outcome = *Box::from_raw(ptr);
+                    handle_worker_outcome(hwnd, outcome);
+                }
+                LRESULT(0)
+            }
             WM_DESTROY => {
                 let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState;
                 if !pointer.is_null() {
-                    drop(Box::from_raw(pointer));
+                    let st = Box::from_raw(pointer);
+                    scrub_edit_control(st.pin);
+                    scrub_edit_control(st.password);
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 }
                 PostQuitMessage(0);
@@ -262,157 +413,216 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 }
 
 unsafe fn create_controls(hwnd: HWND) {
-    let font = HFONT(GetStockObject(DEFAULT_GUI_FONT).0);
+    // SAFETY: Standard Win32 child control creation.
+    unsafe {
+        let font = HFONT(GetStockObject(DEFAULT_GUI_FONT).0);
 
-    let title = create_control(hwnd, w!("STATIC"), "FamiliarSmartcard", 20, 16, 600, 26, 0);
-    set_font(title, font);
-
-    let subtitle = create_control(
-        hwnd,
-        w!("STATIC"),
-        "Sign in with your RS-Key. Keep the native password as recovery.",
-        20,
-        44,
-        760,
-        22,
-        0,
-    );
-    set_font(subtitle, font);
-
-    let status = create_control(
-        hwnd,
-        w!("STATIC"),
-        "Checking for RS-Key...",
-        20,
-        74,
-        760,
-        22,
-        0,
-    );
-    set_font(status, font);
-
-    let pin_label = create_control(
-        hwnd,
-        w!("STATIC"),
-        "PIV PIN (6-8 digits)",
-        20,
-        108,
-        180,
-        22,
-        0,
-    );
-    set_font(pin_label, font);
-    let pin = create_control(hwnd, w!("EDIT"), "", 210, 106, 180, 24, 0);
-    let _ = SendMessageW(
-        pin,
-        EM_SETPASSWORDCHAR,
-        Some(WPARAM(PASSWORD_CHAR)),
-        Some(LPARAM(0)),
-    );
-    set_font(pin, font);
-
-    let password_label =
-        create_control(hwnd, w!("STATIC"), "Windows password", 20, 142, 180, 22, 0);
-    set_font(password_label, font);
-    let password = create_control(hwnd, w!("EDIT"), "", 210, 140, 360, 24, 0);
-    let _ = SendMessageW(
-        password,
-        EM_SETPASSWORDCHAR,
-        Some(WPARAM(PASSWORD_CHAR)),
-        Some(LPARAM(0)),
-    );
-    set_font(password, font);
-
-    let setup = create_control(
-        hwnd,
-        w!("BUTTON"),
-        "Set up this account",
-        20,
-        182,
-        220,
-        40,
-        ID_SETUP as isize,
-    );
-    set_font(setup, font);
-    let probe = create_control(
-        hwnd,
-        w!("BUTTON"),
-        "Probe card",
-        260,
-        182,
-        120,
-        32,
-        ID_PROBE as isize,
-    );
-    set_font(probe, font);
-    let selftest = create_control(
-        hwnd,
-        w!("BUTTON"),
-        "Self-test",
-        390,
-        182,
-        110,
-        32,
-        ID_SELFTEST as isize,
-    );
-    set_font(selftest, font);
-    let register = create_control(
-        hwnd,
-        w!("BUTTON"),
-        "Register provider",
-        510,
-        182,
-        150,
-        32,
-        ID_REGISTER as isize,
-    );
-    set_font(register, font);
-    let clear = create_control(
-        hwnd,
-        w!("BUTTON"),
-        "Clear output",
-        670,
-        182,
-        110,
-        32,
-        ID_CLEAR as isize,
-    );
-    set_font(clear, font);
-
-    let style = WS_CHILD
-        | WS_VISIBLE
-        | WS_BORDER
-        | WS_VSCROLL
-        | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(
-            ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32 | ES_READONLY as u32,
+        let title = create_control(
+            hwnd,
+            w!("STATIC"),
+            "FamiliarSmartcard — Local Account RS-Key Setup",
+            20,
+            14,
+            840,
+            24,
+            0,
         );
+        set_font(title, font);
 
-    let output = CreateWindowExW(
-        WINDOW_EX_STYLE(0),
-        w!("EDIT"),
-        PCWSTR::null(),
-        style,
-        20,
-        236,
-        800,
-        410,
-        Some(hwnd),
-        None,
-        None,
-        None,
-    )
-    .unwrap_or_default();
-    set_font(output, font);
+        let subtitle = create_control(
+            hwnd,
+            w!("STATIC"),
+            "Recommended: generate a 36-char offline recovery password and bind it to your RS-Key PIV 9D slot.",
+            20,
+            40,
+            860,
+            22,
+            0,
+        );
+        set_font(subtitle, font);
 
-    let state = Box::new(AppState {
-        status,
-        output,
-        pin,
-        password,
-    });
-    SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
+        let status = create_control(
+            hwnd,
+            w!("STATIC"),
+            "Checking for RS-Key in background...",
+            20,
+            68,
+            860,
+            22,
+            0,
+        );
+        set_font(status, font);
+
+        let pin_label = create_control(
+            hwnd,
+            w!("STATIC"),
+            "PIV PIN (6-8 digits)",
+            20,
+            102,
+            180,
+            22,
+            0,
+        );
+        set_font(pin_label, font);
+        let pin = create_control(hwnd, w!("EDIT"), "", 210, 100, 180, 24, 0);
+        let _ = SendMessageW(
+            pin,
+            EM_SETPASSWORDCHAR,
+            Some(WPARAM(PASSWORD_CHAR)),
+            Some(LPARAM(0)),
+        );
+        set_font(pin, font);
+
+        let password_label = create_control(
+            hwnd,
+            w!("STATIC"),
+            "Current Windows password",
+            20,
+            136,
+            180,
+            22,
+            0,
+        );
+        set_font(password_label, font);
+        let password = create_control(hwnd, w!("EDIT"), "", 210, 134, 380, 24, 0);
+        let _ = SendMessageW(
+            password,
+            EM_SETPASSWORDCHAR,
+            Some(WPARAM(PASSWORD_CHAR)),
+            Some(LPARAM(0)),
+        );
+        set_font(password, font);
+
+        // Row 1: Primary enrollment vs Dev/Rescue re-bind
+        let btn_setup = create_control(
+            hwnd,
+            w!("BUTTON"),
+            "Set up & rotate password (Recommended)",
+            20,
+            174,
+            290,
+            38,
+            ID_SETUP_ROTATE as isize,
+        );
+        set_font(btn_setup, font);
+
+        let btn_rebind = create_control(
+            hwnd,
+            w!("BUTTON"),
+            "Re-bind current password (Dev / Rescue)",
+            322,
+            174,
+            275,
+            38,
+            ID_REBIND_EXISTING as isize,
+        );
+        set_font(btn_rebind, font);
+
+        // Row 2: Diagnostics, Attestation Pinning, Provider Registration
+        let btn_probe = create_control(
+            hwnd,
+            w!("BUTTON"),
+            "Probe card",
+            20,
+            220,
+            115,
+            30,
+            ID_PROBE as isize,
+        );
+        set_font(btn_probe, font);
+
+        let btn_selftest = create_control(
+            hwnd,
+            w!("BUTTON"),
+            "Self-test vault",
+            145,
+            220,
+            125,
+            30,
+            ID_SELFTEST as isize,
+        );
+        set_font(btn_selftest, font);
+
+        let btn_repin = create_control(
+            hwnd,
+            w!("BUTTON"),
+            "Re-pin card root",
+            280,
+            220,
+            145,
+            30,
+            ID_REPIN_ROOT as isize,
+        );
+        set_font(btn_repin, font);
+
+        let btn_register = create_control(
+            hwnd,
+            w!("BUTTON"),
+            "Register provider",
+            435,
+            220,
+            150,
+            30,
+            ID_REGISTER as isize,
+        );
+        set_font(btn_register, font);
+
+        let btn_clear = create_control(
+            hwnd,
+            w!("BUTTON"),
+            "Clear output",
+            595,
+            220,
+            115,
+            30,
+            ID_CLEAR as isize,
+        );
+        set_font(btn_clear, font);
+
+        let out_style = WS_CHILD
+            | WS_VISIBLE
+            | WS_BORDER
+            | WS_VSCROLL
+            | WINDOW_STYLE(ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32 | ES_READONLY as u32);
+
+        let output = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("EDIT"),
+            PCWSTR::null(),
+            out_style,
+            20,
+            262,
+            860,
+            408,
+            Some(hwnd),
+            None,
+            None,
+            None,
+        )
+        .unwrap_or_default();
+        set_font(output, font);
+
+        let state = Box::new(AppState {
+            status,
+            output,
+            pin,
+            password,
+            buttons: [
+                btn_setup,
+                btn_rebind,
+                btn_probe,
+                btn_selftest,
+                btn_repin,
+                btn_register,
+                btn_clear,
+            ],
+            busy: false,
+        });
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn create_control(
     parent: HWND,
     class: PCWSTR,
@@ -429,264 +639,775 @@ unsafe fn create_control(
     } else {
         Some(HMENU(id as *mut c_void))
     };
-    CreateWindowExW(
-        WINDOW_EX_STYLE(0),
-        class,
-        PCWSTR(text.as_ptr()),
-        WS_CHILD | WS_VISIBLE | WS_BORDER,
-        x,
-        y,
-        width,
-        height,
-        Some(parent),
-        menu,
-        None,
-        None,
-    )
-    .unwrap_or_default()
+    let tab = if id != 0 || class == w!("EDIT") {
+        WS_TABSTOP
+    } else {
+        WINDOW_STYLE(0)
+    };
+    // SAFETY: Standard Win32 control creation.
+    unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            class,
+            PCWSTR(text.as_ptr()),
+            WS_CHILD | WS_VISIBLE | WS_BORDER | tab,
+            x,
+            y,
+            width,
+            height,
+            Some(parent),
+            menu,
+            None,
+            None,
+        )
+        .unwrap_or_default()
+    }
 }
 
 unsafe fn set_font(hwnd: HWND, font: HFONT) {
-    let _ = SendMessageW(
-        hwnd,
-        WM_SETFONT,
-        Some(WPARAM(font.0 as usize)),
-        Some(LPARAM(1)),
-    );
+    // SAFETY: Standard `WM_SETFONT` message.
+    unsafe {
+        let _ = SendMessageW(
+            hwnd,
+            WM_SETFONT,
+            Some(WPARAM(font.0 as usize)),
+            Some(LPARAM(1)),
+        );
+    }
 }
 
-unsafe fn state(hwnd: HWND) -> Option<&'static AppState> {
-    let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const AppState;
-    pointer.as_ref()
+unsafe fn state_mut(hwnd: HWND) -> Option<&'static mut AppState> {
+    // SAFETY: Accessed exclusively on the main Win32 UI thread.
+    unsafe {
+        let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState;
+        pointer.as_mut()
+    }
 }
 
-fn key_present(readers: &[scard_core::ReaderProbe]) -> bool {
-    readers.iter().any(|reader| {
-        reader
-            .slots
-            .iter()
-            .any(|slot| slot.slot == 0x9D && slot.has_key)
-    })
+unsafe fn set_busy(hwnd: HWND, busy: bool, status_text: &str) {
+    // SAFETY: UI thread updates busy flag, button enable state, and status label.
+    unsafe {
+        if let Some(st) = state_mut(hwnd) {
+            st.busy = busy;
+            for &btn in &st.buttons {
+                let _ = EnableWindow(btn, !busy);
+            }
+            let wide = to_wide(status_text);
+            let _ = SetWindowTextW(st.status, PCWSTR(wide.as_ptr()));
+        }
+    }
 }
 
 unsafe fn set_status(hwnd: HWND, text: &str) {
-    if let Some(state) = state(hwnd) {
-        let wide = to_wide(text);
-        let _ = SetWindowTextW(state.status, PCWSTR(wide.as_ptr()));
+    // SAFETY: UI thread updates status text.
+    unsafe {
+        if let Some(st) = state_mut(hwnd) {
+            let wide = to_wide(text);
+            let _ = SetWindowTextW(st.status, PCWSTR(wide.as_ptr()));
+        }
     }
 }
 
-unsafe fn auto_probe(hwnd: HWND) {
-    match scard_core::probe_readers() {
-        Ok(readers) if readers.is_empty() => {
-            set_status(hwnd, "No RS-Key detected. Insert it and click Probe card.");
+unsafe fn set_output(hwnd: HWND, text: &str) {
+    // SAFETY: UI thread updates output edit control.
+    unsafe {
+        if let Some(st) = state_mut(hwnd) {
+            let wide = to_wide(text);
+            let _ = SetWindowTextW(st.output, PCWSTR(wide.as_ptr()));
         }
-        Ok(readers) if key_present(&readers) => {
-            set_status(hwnd, "RS-Key detected. PIV 9D key is ready.");
+    }
+}
+
+fn post_outcome(hwnd_raw: isize, outcome: WorkerOutcome) {
+    let boxed = Box::into_raw(Box::new(outcome));
+    let hwnd = HWND(hwnd_raw as *mut c_void);
+    // SAFETY: Posts heap-allocated `WorkerOutcome` pointer to main UI thread; freed on receipt.
+    unsafe {
+        if PostMessageW(
+            Some(hwnd),
+            WM_WORKER_RESULT,
+            WPARAM(0),
+            LPARAM(boxed as isize),
+        )
+        .is_err()
+        {
+            drop(Box::from_raw(boxed));
         }
-        Ok(_) => {
+    }
+}
+
+fn compliant_9d_present(readers: &[scard_core::ReaderProbe]) -> (bool, Option<String>) {
+    let mut first_policy_err = None;
+    for reader in readers {
+        for slot in &reader.slots {
+            if slot.slot == 0x9D && slot.has_key {
+                if slot.policy_valid_for_9d {
+                    return (true, None);
+                }
+                if first_policy_err.is_none() {
+                    first_policy_err = slot.policy_error.clone();
+                }
+            }
+        }
+    }
+    (false, first_policy_err)
+}
+
+unsafe fn spawn_probe_worker(hwnd: HWND, update_output: bool) {
+    // SAFETY: Checks busy state on UI thread before spawning background worker.
+    unsafe {
+        if state_mut(hwnd).map(|s| s.busy).unwrap_or(true) {
+            return;
+        }
+        set_busy(hwnd, true, "Probing smart card readers...");
+    }
+    let hwnd_raw = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        let pinned_f9 = read_pinned_f9().ok().flatten().map(hex::encode);
+        let outcome = match scard_core::probe_readers() {
+            Ok(readers) if readers.is_empty() => WorkerOutcome::ProbeDone {
+                status: "No RS-Key detected. Insert it (or enable Smart Cards in RDP) and click Probe card.".into(),
+                output: update_output.then(|| "No smart card reader found.\r\n".into()),
+            },
+            Ok(readers) => {
+                let (ready, policy_err) = compliant_9d_present(&readers);
+                let status = if ready {
+                    "RS-Key detected. Slot 0x9D policy (P-256, PIN ALWAYS, On-card) is compliant.".into()
+                } else if let Some(err) = policy_err {
+                    format!("RS-Key detected, but slot 0x9D failed policy check: {err}")
+                } else {
+                    "Smart card detected, but PIV slot 0x9D has no key. Provision the card first.".into()
+                };
+                let output = update_output.then(|| format_readers(&readers, pinned_f9.as_deref()));
+                WorkerOutcome::ProbeDone { status, output }
+            }
+            Err(error) => WorkerOutcome::ProbeDone {
+                status: format!("Card probe failed: {error}"),
+                output: update_output.then(|| format!("Probe failed: {error}\r\n")),
+            },
+        };
+        post_outcome(hwnd_raw, outcome);
+    });
+}
+
+unsafe fn start_setup_with_rotation(hwnd: HWND) {
+    let (pin, current_password) = unsafe {
+        let Some(st) = state_mut(hwnd) else {
+            return;
+        };
+        if st.busy {
+            return;
+        }
+        (read_edit(st.pin), read_edit(st.password))
+    };
+
+    if !valid_pin(&pin) {
+        unsafe { set_status(hwnd, "PIV PIN must be 6-8 ASCII digits.") };
+        return;
+    }
+    if current_password.is_empty() {
+        unsafe {
             set_status(
                 hwnd,
-                "RS-Key detected, but PIV 9D has no key. Provision the card first.",
-            );
-        }
-        Err(error) => {
-            set_status(hwnd, &format!("Card probe failed: {error}"));
-        }
+                "Enter your current Windows password to authorize setup.",
+            )
+        };
+        return;
     }
-}
 
-unsafe fn probe_and_show(hwnd: HWND) {
-    let Some(state) = state(hwnd) else {
-        return;
-    };
+    unsafe {
+        set_busy(
+            hwnd,
+            true,
+            "Phase 1/2: Validating account, checking 0x9D/0xF9 card policy & running card self-test...",
+        );
+    }
 
-    let (status, text) = match scard_core::probe_readers() {
-        Ok(readers) if readers.is_empty() => (
-            "No RS-Key detected.".to_string(),
-            "No smart card reader found.\r\n".to_string(),
-        ),
-        Ok(readers) => {
-            let status = if key_present(&readers) {
-                "RS-Key detected. PIV 9D key is ready.".to_string()
-            } else {
-                "RS-Key detected, but PIV 9D has no key.".to_string()
+    let hwnd_raw = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        let res: Result<PreparedRotation, String> = (|| {
+            // Pre-flight check binary package BEFORE touching the account or smart card!
+            installer::preflight_check_sources()?;
+
+            let user =
+                scard_core::current_user().map_err(|e| format!("Account lookup failed: {e}"))?;
+            let safety =
+                verify_local_workgroup_account(&user.username).map_err(|e| e.to_string())?;
+            validate_windows_password(&user, &current_password)
+                .map_err(|e| format!("Current Windows password is incorrect: {e}"))?;
+
+            let new_password = generate_recovery_password();
+            let placeholder_ts = password_last_set(&user.username).map_err(|e| e.to_string())?;
+
+            let enrolled = enroll_with_options(&EnrollOptions {
+                reader: None,
+                password: &new_password,
+                sid: &user.sid,
+                username: &user.username,
+                computer: &user.computer,
+                password_last_set: placeholder_ts,
+                attestation_policy: AttestationPolicy::EnforceOrPinFirstUse,
+            })
+            .map_err(|e| format!("Card enrollment failed: {e}"))?;
+
+            // Mandatory Phase B card self-test BEFORE touching the real Windows password!
+            let mut pin_bytes = Zeroizing::new(pin.as_bytes().to_vec());
+            let decrypted = scard_core::unlock(
+                enrolled.vault.clone(),
+                &user.sid,
+                &user.username,
+                &user.computer,
+                None,
+                &mut pin_bytes,
+            )
+            .map_err(|e| format!("Card self-test failed (Windows password NOT changed): {e}"))?;
+
+            if !scard_core::crypto::constant_time_eq(decrypted.as_bytes(), new_password.as_bytes())
+            {
+                return Err(
+                    "Card self-test decrypted mismatch (Windows password NOT changed).".into(),
+                );
+            }
+
+            let f9_status = match (enrolled.f9_fingerprint, enrolled.f9_newly_pinned) {
+                (Some(fp), true) => format!("{} (verified & newly pinned)", hex::encode(fp)),
+                (Some(fp), false) => format!("{} (verified against pinned root)", hex::encode(fp)),
+                (None, _) => "(card did not return 0xF9 attestation)".into(),
             };
-            (status, format_readers(&readers))
-        }
-        Err(error) => (
-            format!("Card probe failed: {error}"),
-            format!("Probe failed: {error}\r\n"),
-        ),
-    };
 
-    let status_w = to_wide(&status);
-    let _ = SetWindowTextW(state.status, PCWSTR(status_w.as_ptr()));
-    let output_w = to_wide(&text);
-    let _ = SetWindowTextW(state.output, PCWSTR(output_w.as_ptr()));
+            Ok(PreparedRotation {
+                user,
+                lockout_threshold: safety.lockout_threshold,
+                new_password,
+                dek: enrolled.dek,
+                candidate_vault: enrolled.vault,
+                card_name: enrolled
+                    .card_name
+                    .unwrap_or_else(|| "(unknown PIV card)".into()),
+                fingerprint_hex: hex::encode(enrolled.card_pub_fingerprint),
+                f9_status,
+                touch_policy: enrolled.touch_policy,
+            })
+        })();
+
+        match res {
+            Ok(prepared) => post_outcome(
+                hwnd_raw,
+                WorkerOutcome::RotationCandidateReady(Box::new(prepared)),
+            ),
+            Err(err) => post_outcome(
+                hwnd_raw,
+                WorkerOutcome::SimpleDone {
+                    status: err.clone(),
+                    output: Some(format!("{err}\r\n")),
+                    clear_secrets: false,
+                    critical_modal_error: None,
+                },
+            ),
+        }
+    });
 }
 
-unsafe fn setup_account(hwnd: HWND) {
-    let Some(state) = state(hwnd) else {
-        return;
+unsafe fn commit_confirmed_rotation(hwnd: HWND, prepared: PreparedRotation) {
+    unsafe {
+        set_busy(
+            hwnd,
+            true,
+            "Phase 2/2: Rotating Windows password, committing vault & registering provider...",
+        );
+    }
+    let hwnd_raw = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        let user = &prepared.user;
+
+        // CRITICAL SAFETY ORDER: Install and register the Credential Provider binaries
+        // FIRST, BEFORE rotating the Windows password! If installation fails for any
+        // reason, the user's original Windows password remains 100% untouched!
+        let install_summary = match installer::install_and_register() {
+            Ok(summary) => summary,
+            Err(err) => {
+                post_outcome(
+                    hwnd_raw,
+                    WorkerOutcome::SimpleDone {
+                        status:
+                            "Provider installation failed — your Windows password was NOT changed."
+                                .into(),
+                        output: Some(format!(
+                            "Credential Provider installation failed (your Windows password was NOT modified):\r\n{err}\r\n"
+                        )),
+                        clear_secrets: false,
+                        critical_modal_error: None,
+                    },
+                );
+                return;
+            }
+        };
+
+        if let Err(e) = stage_pending_vault_with_backup(&user.sid, &prepared.candidate_vault) {
+            post_outcome(
+                hwnd_raw,
+                WorkerOutcome::SimpleDone {
+                    status: format!("Staging pending vault failed (password NOT changed): {e}"),
+                    output: None,
+                    clear_secrets: false,
+                    critical_modal_error: None,
+                },
+            );
+            return;
+        }
+
+        if let Err(e) =
+            rotate_local_password_and_disable_expiry(&user.username, &prepared.new_password)
+        {
+            post_outcome(
+                hwnd_raw,
+                WorkerOutcome::SimpleDone {
+                    status: format!("Windows password rotation failed: {e}"),
+                    output: Some(format!("Password rotation failed: {e}\r\n")),
+                    clear_secrets: false,
+                    critical_modal_error: None,
+                },
+            );
+            return;
+        }
+
+        // From this point on, the OS password IS `prepared.new_password` (which the user
+        // verified on their offline recovery sheet), and the Credential Provider is ALREADY
+        // installed. Re-bind AAD with the new timestamp using the retained `Zeroizing` DEK.
+        let commit_res: Result<(), String> = (|| {
+            let new_last_set = password_last_set(&user.username).map_err(|e| e.to_string())?;
+            let final_vault = prepared
+                .candidate_vault
+                .reencrypt_password_with_dek(
+                    &prepared.dek,
+                    &prepared.new_password,
+                    &user.sid,
+                    &user.username,
+                    &user.computer,
+                    new_last_set,
+                )
+                .map_err(|e| e.to_string())?;
+
+            write_vault(&user.sid, &final_vault).map_err(|e| e.to_string())?;
+            write_touch_policy(&user.sid, prepared.touch_policy).map_err(|e| e.to_string())?;
+            validate_windows_password(user, &prepared.new_password)
+                .map_err(|e| format!("Post-rotation LogonUserW check failed: {e}"))?;
+            Ok(())
+        })();
+
+        match commit_res {
+            Ok(()) => {
+                let mut report = format!(
+                    "Setup and password rotation complete.\r\n\
+                     Account:        {}\\{}\r\n\
+                     SID:            {}\r\n\
+                     Card:           {}\r\n\
+                     9D Fingerprint: {}\r\n\
+                     0xF9 Root:      {}\r\n\
+                     Card Self-Test: succeeded\r\n\
+                     Password:       rotated to 36-char recovery password (never expires)\r\n\
+                     {}\r\n",
+                    user.domain,
+                    user.username,
+                    user.sid,
+                    prepared.card_name,
+                    prepared.fingerprint_hex,
+                    prepared.f9_status,
+                    install_summary
+                );
+                if prepared.lockout_threshold == 0 {
+                    report.push_str(
+                        "\r\nSECURITY WARNING: Windows Account Lockout Threshold is currently 0 (disabled).\r\n\
+                         Run `net accounts /lockoutthreshold:5` in an elevated shell before enabling RDP.\r\n",
+                    );
+                }
+                post_outcome(
+                    hwnd_raw,
+                    WorkerOutcome::SimpleDone {
+                        status: "Setup complete. Lock the screen and sign in with your RS-Key."
+                            .into(),
+                        output: Some(report),
+                        clear_secrets: true,
+                        critical_modal_error: None,
+                    },
+                );
+            }
+            Err(err) => {
+                let critical = format!(
+                    "CRITICAL NOTICE: Your Windows password HAS ALREADY BEEN UPDATED to the recovery sheet password you just verified, \
+                     but finalizing the vault or provider registration encountered an error:\r\n\r\n{err}\r\n\r\n\
+                     Keep your recovery sheet safe! Use that recovery password (including hyphens) to sign in and click 'Re-bind current password'."
+                );
+                post_outcome(
+                    hwnd_raw,
+                    WorkerOutcome::SimpleDone {
+                        status:
+                            "Password rotated, but vault/provider finalization failed — see alert."
+                                .into(),
+                        output: Some(format!("{critical}\r\n")),
+                        clear_secrets: true,
+                        critical_modal_error: Some(critical),
+                    },
+                );
+            }
+        }
+    });
+}
+
+unsafe fn start_rebind_existing_password(hwnd: HWND) {
+    let (pin, password) = unsafe {
+        let Some(st) = state_mut(hwnd) else {
+            return;
+        };
+        if st.busy {
+            return;
+        }
+        (read_edit(st.pin), read_edit(st.password))
     };
 
-    let pin = read_edit(state.pin);
-    let password = read_edit(state.password);
     if !valid_pin(&pin) {
-        set_status(hwnd, "PIV PIN must be 6-8 digits.");
+        unsafe { set_status(hwnd, "PIV PIN must be 6-8 ASCII digits.") };
         return;
     }
     if password.is_empty() {
-        set_status(hwnd, "Enter the current Windows password.");
+        unsafe { set_status(hwnd, "Enter the current Windows password to re-bind.") };
         return;
     }
 
-    set_status(hwnd, "Detecting RS-Key...");
-    let readers = match scard_core::probe_readers() {
-        Ok(readers) => readers,
-        Err(error) => {
-            set_status(hwnd, &format!("Card probe failed: {error}"));
-            return;
-        }
+    // Explicit security warning per project design.
+    let confirm = unsafe {
+        MessageBoxW(
+            Some(hwnd),
+            w!("Re-binding an existing password WITHOUT rotating to a high-entropy random recovery password is NOT RECOMMENDED for production.\r\n\r\n\
+                Because the native Windows password provider stays enabled as a recovery path, a weak or reused password can still be guessed at the lock screen (especially over non-NLA RDP).\r\n\r\n\
+                Only use this option in isolated development VMs or when re-binding an already-rotated recovery password.\r\n\r\n\
+                Proceed with re-binding the current password?"),
+            w!("Security Warning — Re-bind Existing Password"),
+            MB_YESNO | MB_ICONWARNING,
+        )
     };
-    if !key_present(&readers) {
-        set_status(
+    if confirm.0 != 6 {
+        return;
+    }
+
+    unsafe {
+        set_busy(
             hwnd,
-            "PIV 9D key not found. Provision the card before setup.",
+            true,
+            "Re-binding current password, running card self-test & registering provider...",
         );
-        return;
     }
 
-    set_status(hwnd, "Resolving the interactive account...");
-    let user = match scard_core::current_user() {
-        Ok(user) => user,
-        Err(error) => {
-            set_status(hwnd, &format!("Account lookup failed: {error}"));
-            return;
-        }
-    };
+    let hwnd_raw = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        let res: Result<String, String> = (|| {
+            // Install and register provider binaries BEFORE writing vault!
+            let install_summary = installer::install_and_register()?;
 
-    set_status(hwnd, "Validating the Windows password...");
-    if let Err(error) = validate_windows_password(&user, &password) {
-        set_status(
-            hwnd,
-            &format!("Windows password validation failed: {error}"),
-        );
-        return;
-    }
+            let user =
+                scard_core::current_user().map_err(|e| format!("Account lookup failed: {e}"))?;
+            let safety =
+                verify_local_workgroup_account(&user.username).map_err(|e| e.to_string())?;
+            validate_windows_password(&user, &password)
+                .map_err(|e| format!("Windows password validation failed: {e}"))?;
+            let last_set = password_last_set(&user.username).map_err(|e| e.to_string())?;
 
-    set_status(hwnd, "Binding the vault to the RS-Key...");
-    let password_last_set = match scard_core::account::password_last_set(&user.username) {
-        Ok(value) => value,
-        Err(error) => {
-            set_status(hwnd, &format!("Password timestamp lookup failed: {error}"));
-            return;
-        }
-    };
+            let enrolled = enroll_with_options(&EnrollOptions {
+                reader: None,
+                password: &password,
+                sid: &user.sid,
+                username: &user.username,
+                computer: &user.computer,
+                password_last_set: last_set,
+                attestation_policy: AttestationPolicy::EnforceOrPinFirstUse,
+            })
+            .map_err(|e| format!("Enrollment failed: {e}"))?;
 
-    let enrolled = match scard_core::enroll(
-        None,
-        &password,
-        &user.sid,
-        &user.username,
-        &user.computer,
-        password_last_set,
-    ) {
-        Ok(enrolled) => enrolled,
-        Err(error) => {
-            set_status(hwnd, &format!("Enrollment failed: {error}"));
-            return;
-        }
-    };
+            stage_pending_vault_with_backup(&user.sid, &enrolled.vault)
+                .map_err(|e| format!("Vault staging failed: {e}"))?;
+            write_vault(&user.sid, &enrolled.vault)
+                .map_err(|e| format!("Vault write failed: {e}"))?;
+            write_touch_policy(&user.sid, enrolled.touch_policy)
+                .map_err(|e| format!("Touch policy write failed: {e}"))?;
 
-    if let Err(error) = scard_core::storage::write_vault(&user.sid, &enrolled.vault) {
-        set_status(hwnd, &format!("Vault write failed: {error}"));
-        return;
-    }
+            self_test_internal(&pin, &password, &user)?;
 
-    set_status(hwnd, "Running the self-test...");
-    if let Err(error) = self_test_internal(&pin, &password, &user) {
-        set_status(hwnd, &format!("Self-test failed: {error}"));
-        return;
-    }
+            let f9_status = match (enrolled.f9_fingerprint, enrolled.f9_newly_pinned) {
+                (Some(fp), true) => format!("{} (verified & newly pinned)", hex::encode(fp)),
+                (Some(fp), false) => format!("{} (verified against pinned root)", hex::encode(fp)),
+                (None, _) => "(card did not return 0xF9 attestation)".into(),
+            };
 
-    set_status(hwnd, "Registering the sign-in provider...");
-    let register_result = register_provider_internal();
-
-    let fingerprint = hex::encode(enrolled.card_pub_fingerprint);
-    let mut message = format!(
-        "Setup complete.\r\n\
-         Account: {}\\{}\r\n\
-         SID: {}\r\n\
-         Card: {}\r\n\
-         Fingerprint: {}\r\n\
-         Self-test: succeeded\r\n",
-        user.domain,
-        user.username,
-        user.sid,
-        enrolled.card_name.as_deref().unwrap_or("(unknown)"),
-        fingerprint
-    );
-    let status = match register_result {
-        Ok(output) => {
-            message.push_str("Sign-in provider: registered.\r\n");
-            if !output.trim().is_empty() {
-                message.push_str(&output);
-                message.push_str("\r\n");
+            let mut msg = format!(
+                "Re-bind complete (existing password kept).\r\n\
+                 Account:        {}\\{}\r\n\
+                 SID:            {}\r\n\
+                 Card:           {}\r\n\
+                 9D Fingerprint: {}\r\n\
+                 0xF9 Root:      {}\r\n\
+                 Self-Test:      succeeded\r\n\
+                 {}\r\n",
+                user.domain,
+                user.username,
+                user.sid,
+                enrolled.card_name.as_deref().unwrap_or("(unknown)"),
+                hex::encode(enrolled.card_pub_fingerprint),
+                f9_status,
+                install_summary
+            );
+            if safety.lockout_threshold == 0 {
+                msg.push_str(
+                    "\r\nSECURITY WARNING: Account Lockout Threshold is 0. Enable `net accounts /lockoutthreshold:5`.\r\n",
+                );
             }
-            "Setup complete. Lock the screen and sign in with RS-Key."
-        }
-        Err(error) => {
-            message.push_str(&format!("Sign-in provider: not registered ({error}).\r\n"));
-            "Account bound, but provider registration failed."
-        }
-    };
+            Ok(msg)
+        })();
 
-    let message_w = to_wide(&message);
-    let _ = SetWindowTextW(state.output, PCWSTR(message_w.as_ptr()));
-    set_status(hwnd, status);
-    let _ = SetWindowTextW(state.password, PCWSTR::null());
-    let _ = SetWindowTextW(state.pin, PCWSTR::null());
+        match res {
+            Ok(report) => post_outcome(
+                hwnd_raw,
+                WorkerOutcome::SimpleDone {
+                    status: "Account re-bound and provider registered. Lock the screen to test."
+                        .into(),
+                    output: Some(report),
+                    clear_secrets: true,
+                    critical_modal_error: None,
+                },
+            ),
+            Err(err) => post_outcome(
+                hwnd_raw,
+                WorkerOutcome::SimpleDone {
+                    status: err.clone(),
+                    output: Some(format!("{err}\r\n")),
+                    clear_secrets: false,
+                    critical_modal_error: None,
+                },
+            ),
+        }
+    });
 }
 
-unsafe fn self_test(hwnd: HWND) {
-    let Some(state) = state(hwnd) else {
-        return;
-    };
-    let pin = read_edit(state.pin);
-    let expected = read_edit(state.password);
-    if !valid_pin(&pin) {
-        set_status(hwnd, "PIV PIN must be 6-8 digits.");
-        return;
-    }
-
-    let user = match scard_core::current_user() {
-        Ok(user) => user,
-        Err(error) => {
-            set_status(hwnd, &format!("Account lookup failed: {error}"));
+unsafe fn start_self_test(hwnd: HWND) {
+    let (pin, expected) = unsafe {
+        let Some(st) = state_mut(hwnd) else {
+            return;
+        };
+        if st.busy {
             return;
         }
+        (read_edit(st.pin), read_edit(st.password))
     };
 
-    match self_test_internal(&pin, &expected, &user) {
-        Ok(()) => {
-            set_status(hwnd, "Self-test succeeded: the RS-Key decrypted the vault.");
+    if !valid_pin(&pin) {
+        unsafe { set_status(hwnd, "PIV PIN must be 6-8 ASCII digits.") };
+        return;
+    }
+
+    unsafe {
+        set_busy(
+            hwnd,
+            true,
+            "Running stored-vault RS-Key unlock self-test...",
+        )
+    };
+    let hwnd_raw = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        let res = scard_core::current_user()
+            .map_err(|e| format!("Account lookup failed: {e}"))
+            .and_then(|user| self_test_internal(&pin, &expected, &user));
+        match res {
+            Ok(()) => post_outcome(
+                hwnd_raw,
+                WorkerOutcome::SimpleDone {
+                    status:
+                        "Self-test succeeded: the RS-Key unlocked and verified the bound vault."
+                            .into(),
+                    output: None,
+                    clear_secrets: false,
+                    critical_modal_error: None,
+                },
+            ),
+            Err(err) => post_outcome(
+                hwnd_raw,
+                WorkerOutcome::SimpleDone {
+                    status: format!("Self-test failed: {err}"),
+                    output: Some(format!("Self-test failed: {err}\r\n")),
+                    clear_secrets: false,
+                    critical_modal_error: None,
+                },
+            ),
         }
-        Err(error) => {
-            set_status(hwnd, &format!("Self-test failed: {error}"));
+    });
+}
+
+unsafe fn start_repin_card_root(hwnd: HWND) {
+    unsafe {
+        if state_mut(hwnd).map(|s| s.busy).unwrap_or(true) {
+            return;
+        }
+    }
+
+    let confirm = unsafe {
+        MessageBoxW(
+            Some(hwnd),
+            w!("Replace the machine-pinned 0xF9 attestation root with the currently connected RS-Key?\r\n\r\n\
+                Only do this after intentionally burning OTP (`rsk otp burn`, which regenerates the device attestation key) \
+                or replacing your physical RS-Key."),
+            w!("Confirm Re-pin Card Attestation Root"),
+            MB_YESNO | MB_ICONWARNING,
+        )
+    };
+    if confirm.0 != 6 {
+        return;
+    }
+
+    unsafe {
+        set_busy(
+            hwnd,
+            true,
+            "Verifying 0x9D/0xF9 attestation chain and pinning root...",
+        )
+    };
+    let hwnd_raw = hwnd.0 as isize;
+    std::thread::spawn(move || match repin_connected_card_attestation(None) {
+        Ok(fp) => {
+            let hex_fp = hex::encode(fp);
+            post_outcome(
+                hwnd_raw,
+                WorkerOutcome::SimpleDone {
+                    status: "Pinned new 0xF9 card attestation root in HKLM.".into(),
+                    output: Some(format!(
+                        "Verified 0x9D/0xF9 attestation signature and updated HKLM pin:\r\n  Pinned 0xF9 SHA-256: {hex_fp}\r\n"
+                    )),
+                    clear_secrets: false,
+                    critical_modal_error: None,
+                },
+            );
+        }
+        Err(err) => post_outcome(
+            hwnd_raw,
+            WorkerOutcome::SimpleDone {
+                status: format!("Re-pin failed: {err}"),
+                output: Some(format!("Re-pin card root failed: {err}\r\n")),
+                clear_secrets: false,
+                critical_modal_error: None,
+            },
+        ),
+    });
+}
+
+unsafe fn start_register_provider(hwnd: HWND) {
+    unsafe {
+        if state_mut(hwnd).map(|s| s.busy).unwrap_or(true) {
+            return;
+        }
+        set_busy(
+            hwnd,
+            true,
+            "Installing binaries and registering Credential Provider...",
+        );
+    }
+    let hwnd_raw = hwnd.0 as isize;
+    std::thread::spawn(move || match installer::install_and_register() {
+        Ok(summary) => post_outcome(
+            hwnd_raw,
+            WorkerOutcome::SimpleDone {
+                status: "Sign-in provider installed and registered.".into(),
+                output: Some(format!("{summary}\r\n")),
+                clear_secrets: false,
+                critical_modal_error: None,
+            },
+        ),
+        Err(err) => post_outcome(
+            hwnd_raw,
+            WorkerOutcome::SimpleDone {
+                status: format!("Provider registration failed: {err}"),
+                output: Some(format!("Provider registration failed:\r\n{err}\r\n")),
+                clear_secrets: false,
+                critical_modal_error: None,
+            },
+        ),
+    });
+}
+
+unsafe fn handle_worker_outcome(hwnd: HWND, outcome: WorkerOutcome) {
+    // SAFETY: Invoked on main UI thread from `WM_WORKER_RESULT`.
+    unsafe {
+        match outcome {
+            WorkerOutcome::ProbeDone { status, output } => {
+                set_busy(hwnd, false, &status);
+                if let Some(text) = output {
+                    set_output(hwnd, &text);
+                }
+            }
+            WorkerOutcome::SimpleDone {
+                status,
+                output,
+                clear_secrets,
+                critical_modal_error,
+            } => {
+                set_busy(hwnd, false, &status);
+                if let Some(text) = output {
+                    set_output(hwnd, &text);
+                }
+                if clear_secrets {
+                    if let Some(st) = state_mut(hwnd) {
+                        scrub_edit_control(st.pin);
+                        scrub_edit_control(st.password);
+                    }
+                }
+                if let Some(alert) = critical_modal_error {
+                    let alert_w = to_wide(&alert);
+                    let _ = MessageBoxW(
+                        Some(hwnd),
+                        PCWSTR(alert_w.as_ptr()),
+                        w!("FamiliarSmartcard — Action Required"),
+                        MB_OK | MB_ICONERROR,
+                    );
+                }
+            }
+            WorkerOutcome::RotationCandidateReady(prepared) => {
+                set_busy(
+                    hwnd,
+                    false,
+                    "Card self-test passed! Record and confirm your recovery sheet to apply.",
+                );
+                let sheet = RecoverySheet {
+                    computer: &prepared.user.computer,
+                    domain: &prepared.user.domain,
+                    username: &prepared.user.username,
+                    sid: &prepared.user.sid,
+                    card_name: &prepared.card_name,
+                    card_fingerprint_hex: &prepared.fingerprint_hex,
+                    password: &prepared.new_password,
+                    created_utc_unix: prepared.candidate_vault.created_at,
+                };
+                if confirm_recovery_sheet(hwnd, &sheet) {
+                    commit_confirmed_rotation(hwnd, *prepared);
+                } else {
+                    drop(prepared);
+                    set_status(
+                        hwnd,
+                        "Setup cancelled at recovery confirmation. Your Windows password was NOT changed.",
+                    );
+                }
+            }
         }
     }
 }
 
-fn self_test_internal(
-    pin: &str,
-    expected_password: &str,
-    user: &scard_core::UserInfo,
-) -> Result<(), String> {
-    let vault = scard_core::storage::read_vault(&user.sid)
+fn self_test_internal(pin: &str, expected_password: &str, user: &UserInfo) -> Result<(), String> {
+    let vault = read_vault(&user.sid)
         .map_err(|error| format!("Vault read failed: {error}"))?
         .ok_or_else(|| "No vault is bound to this account.".to_string())?;
+
+    let current_ts =
+        password_last_set(&user.username).map_err(|e| format!("Timestamp lookup failed: {e}"))?;
+    if !scard_core::vault::password_last_set_matches(vault.password_last_set, current_ts) {
+        return Err(
+            "The Windows password has changed since enrollment; re-enrollment is required.".into(),
+        );
+    }
 
     let mut pin_bytes = Zeroizing::new(pin.as_bytes().to_vec());
     let decrypted = scard_core::unlock(
@@ -699,71 +1420,15 @@ fn self_test_internal(
     )
     .map_err(|error| format!("Unlock failed: {error}"))?;
 
-    if !expected_password.is_empty() && decrypted.as_str() != expected_password {
-        return Err("Decrypted password does not match the entered password.".into());
+    if !expected_password.is_empty()
+        && !scard_core::crypto::constant_time_eq(decrypted.as_bytes(), expected_password.as_bytes())
+    {
+        return Err("Decrypted vault password does not match the entered password.".into());
     }
     Ok(())
 }
 
-unsafe fn register_provider(hwnd: HWND) {
-    match register_provider_internal() {
-        Ok(output) => {
-            set_status(hwnd, "Sign-in provider registered.");
-            if let Some(state) = state(hwnd) {
-                let text = if output.trim().is_empty() {
-                    "Sign-in provider registered.\r\n".to_string()
-                } else {
-                    output
-                };
-                let wide = to_wide(&text);
-                let _ = SetWindowTextW(state.output, PCWSTR(wide.as_ptr()));
-            }
-        }
-        Err(error) => {
-            set_status(hwnd, &format!("Provider registration failed: {error}"));
-        }
-    }
-}
-
-fn register_provider_internal() -> Result<String, String> {
-    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
-    let directory = exe
-        .parent()
-        .ok_or_else(|| "Cannot determine the application directory.".to_string())?;
-    let script = directory.join("register_cp.ps1");
-    let dll = directory.join("cred_provider.dll");
-
-    if !script.exists() {
-        return Err(format!("{} was not found.", script.display()));
-    }
-    if !dll.exists() {
-        return Err(format!("{} was not found.", dll.display()));
-    }
-
-    let output = Command::new("powershell.exe")
-        .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-File")
-        .arg(script.as_os_str())
-        .arg("-DllPath")
-        .arg(dll.as_os_str())
-        .output()
-        .map_err(|error| format!("Cannot start PowerShell: {error}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    if !output.status.success() {
-        return Err(format!(
-            "register_cp.ps1 failed.\r\n{}\r\n{}",
-            stdout.trim(),
-            stderr.trim()
-        ));
-    }
-    Ok(stdout)
-}
-
-fn validate_windows_password(user: &scard_core::UserInfo, password: &str) -> Result<(), String> {
+fn validate_windows_password(user: &UserInfo, password: &str) -> Result<(), String> {
     let username: Vec<u16> = user
         .username
         .encode_utf16()
@@ -774,9 +1439,11 @@ fn validate_windows_password(user: &scard_core::UserInfo, password: &str) -> Res
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    let password_w: Vec<u16> = password.encode_utf16().chain(std::iter::once(0)).collect();
+    let password_w: Zeroizing<Vec<u16>> =
+        Zeroizing::new(password.encode_utf16().chain(std::iter::once(0)).collect());
     let mut token = HANDLE::default();
 
+    // SAFETY: Validates credentials against local LSA without creating an interactive profile.
     let result = unsafe {
         LogonUserW(
             PCWSTR(username.as_ptr()),
@@ -790,29 +1457,81 @@ fn validate_windows_password(user: &scard_core::UserInfo, password: &str) -> Res
     if let Err(error) = result {
         return Err(error.message());
     }
+    // SAFETY: Close returned logon token immediately.
     unsafe {
         let _ = CloseHandle(token);
     }
     Ok(())
 }
 
-unsafe fn read_edit(hwnd: HWND) -> Zeroizing<String> {
-    let length = GetWindowTextLengthW(hwnd);
-    if length <= 0 {
-        return Zeroizing::new(String::new());
+unsafe fn scrub_edit_control(hwnd: HWND) {
+    if !hwnd.0.is_null() {
+        let dummy = w!("00000000000000000000000000000000");
+        // SAFETY: Overwrites internal Win32 Edit control buffer before clearing.
+        unsafe {
+            let _ = SetWindowTextW(hwnd, dummy);
+            let _ = SetWindowTextW(hwnd, PCWSTR::null());
+        }
     }
-    let mut buffer = vec![0u16; length as usize + 1];
-    let copied = GetWindowTextW(hwnd, &mut buffer);
-    buffer.truncate(copied.max(0) as usize);
-    Zeroizing::new(String::from_utf16_lossy(&buffer))
+}
+
+unsafe fn read_edit(hwnd: HWND) -> Zeroizing<String> {
+    // SAFETY: Queries edit control length and copies into a `Zeroizing<Vec<u16>>`.
+    unsafe {
+        let length = GetWindowTextLengthW(hwnd);
+        if length <= 0 {
+            return Zeroizing::new(String::new());
+        }
+        let mut buffer = Zeroizing::new(vec![0u16; length as usize + 1]);
+        let copied = GetWindowTextW(hwnd, buffer.as_mut_slice());
+        let valid = copied.max(0) as usize;
+        Zeroizing::new(String::from_utf16_lossy(&buffer[..valid]))
+    }
 }
 
 fn valid_pin(pin: &str) -> bool {
     (6..=8).contains(&pin.len()) && pin.chars().all(|c| c.is_ascii_digit())
 }
 
-fn format_readers(readers: &[scard_core::ReaderProbe]) -> String {
+fn format_pin_policy(v: Option<u8>) -> &'static str {
+    match v {
+        Some(PIN_POLICY_NEVER) => "NEVER (rejected)",
+        Some(PIN_POLICY_ONCE) => "ONCE (rejected)",
+        Some(PIN_POLICY_ALWAYS) => "ALWAYS",
+        Some(_) => "unknown",
+        None => "n/a",
+    }
+}
+
+fn format_touch_policy(v: Option<u8>) -> &'static str {
+    match v {
+        Some(TOUCH_POLICY_NEVER) => "NEVER",
+        Some(TOUCH_POLICY_ALWAYS) => "ALWAYS",
+        Some(TOUCH_POLICY_CACHED) => "CACHED",
+        Some(_) => "unknown",
+        None => "n/a",
+    }
+}
+
+fn format_origin(v: Option<u8>) -> &'static str {
+    match v {
+        Some(ORIGIN_GENERATED) => "On-card",
+        Some(ORIGIN_IMPORTED) => "Imported (rejected)",
+        Some(_) => "unknown",
+        None => "n/a",
+    }
+}
+
+fn format_readers(readers: &[scard_core::ReaderProbe], pinned_f9: Option<&str>) -> String {
     let mut out = String::new();
+    if let Some(pin_hex) = pinned_f9 {
+        out.push_str(&format!("Machine-pinned 0xF9 root: {pin_hex}\r\n\r\n"));
+    } else {
+        out.push_str(
+            "Machine-pinned 0xF9 root: (not pinned yet — will pin on first enrollment)\r\n\r\n",
+        );
+    }
+
     for reader in readers {
         out.push_str(&format!("Reader: {}\r\n", reader.reader));
         out.push_str(&format!("  ATR: {}\r\n", reader.atr_hex));
@@ -825,6 +1544,19 @@ fn format_readers(readers: &[scard_core::ReaderProbe]) -> String {
                 "  Algorithms: {}\r\n",
                 hex::encode(&reader.algorithms)
             ));
+            match (&reader.f9_fingerprint_hex, reader.attestation_verified) {
+                (Some(f9_hex), true) => {
+                    let pin_match = match pinned_f9 {
+                        Some(p) if p.eq_ignore_ascii_case(f9_hex) => "matches machine pin",
+                        Some(_) => "MISMATCH with machine pin (run Re-pin card root if expected)",
+                        None => "verified (unpinned)",
+                    };
+                    out.push_str(&format!("  0xF9 Attestation: {f9_hex} ({pin_match})\r\n"));
+                }
+                _ => {
+                    out.push_str("  0xF9 Attestation: not available\r\n");
+                }
+            }
         } else {
             out.push_str("  PIV: not selected\r\n");
         }
@@ -832,20 +1564,28 @@ fn format_readers(readers: &[scard_core::ReaderProbe]) -> String {
             out.push_str(&format!("  Error: {error}\r\n"));
         }
         for slot in &reader.slots {
-            out.push_str(&format!(
-                "  Slot 0x{:02X}: {}{}\r\n",
-                slot.slot,
-                if slot.has_key {
-                    "key present"
+            if slot.has_key {
+                let policy_desc = if let Some(pol) = &slot.policy {
+                    format!(
+                        " [alg=0x{:02X}, pin={}, touch={}, origin={}]",
+                        pol.algorithm.unwrap_or(0),
+                        format_pin_policy(pol.pin_policy),
+                        format_touch_policy(pol.touch_policy),
+                        format_origin(pol.origin)
+                    )
                 } else {
-                    "no key"
-                },
-                if slot.metadata_hex.is_empty() {
                     String::new()
-                } else {
-                    format!(", metadata={}", slot.metadata_hex)
+                };
+                out.push_str(&format!(
+                    "  Slot 0x{:02X}: key present{policy_desc}\r\n",
+                    slot.slot
+                ));
+                if let Some(err) = &slot.policy_error {
+                    out.push_str(&format!("    Policy error: {err}\r\n"));
                 }
-            ));
+            } else {
+                out.push_str(&format!("  Slot 0x{:02X}: no key\r\n", slot.slot));
+            }
         }
         out.push_str("\r\n");
     }

@@ -1,0 +1,15 @@
+[package]
+name = "auth-helper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Isolated same-session PC/SC unlock helper for the FamiliarSmartcard Credential Provider"
+
+[[bin]]
+name = "familiar-auth-helper"
+path = "src/main.rs"
+
+[dependencies]
+scard-core = { path = "../scard-core" }
+zeroize.workspace = true

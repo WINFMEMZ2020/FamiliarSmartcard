@@ -1,75 +1,368 @@
-//! Registry storage for per-user vault blobs.
+//! Registry storage for per-user vault blobs, touch policy hints, and pinned
+//! card `0xF9` attestation roots, plus SDDL ACL enforcement.
 //!
-//! The registry value contains a DPAPI machine-scope envelope. The DPAPI
-//! entropy is derived from the SID so a blob cannot be transplanted between
-//! users. The ACL must be restricted to SYSTEM/Administrators by the installer.
+//! Security rules:
+//! - Every registry key created under `HKLM\SOFTWARE\FamiliarSmartcard` is
+//!   atomically created with SDDL `D:PAI(A;OICI;KA;;;SY)(A;OICI;KA;;;BA)` so
+//!   standard local users never inherit read or write access.
+//! - No diagnostic log is ever written to world-writable `C:\Windows\Temp`.
 
+#![deny(unsafe_op_in_unsafe_fn)]
+
+use crate::crypto::constant_time_eq;
 use crate::dpapi;
 use crate::error::{AuthError, Result};
 use crate::vault::VaultBlob;
 use std::ffi::c_void;
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS};
+use std::mem::size_of;
+use std::path::Path;
+use windows::core::{w, BOOL, PCWSTR};
+use windows::Win32::Foundation::{
+    LocalFree, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, HLOCAL,
+};
+use windows::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
+    SE_REGISTRY_KEY,
+};
+use windows::Win32::Security::{
+    GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+};
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegGetValueW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE,
-    KEY_WOW64_64KEY, KEY_WRITE, REG_BINARY, REG_OPTION_NON_VOLATILE, RRF_RT_REG_BINARY,
+    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegGetValueW, RegSetValueExW, HKEY,
+    HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, KEY_WOW64_64KEY, KEY_WRITE, REG_BINARY, REG_DWORD,
+    REG_OPTION_NON_VOLATILE, RRF_RT_REG_BINARY, RRF_RT_REG_DWORD,
 };
 
-const REG_PREFIX: &str = "SOFTWARE\\FamiliarSmartcard\\Users\\";
-const VALUE_NAME: &str = "VaultBlob";
+const ROOT_SUBKEY: &str = "SOFTWARE\\FamiliarSmartcard";
+const USERS_SUBKEY: &str = "SOFTWARE\\FamiliarSmartcard\\Users";
+const ATTESTATION_SUBKEY: &str = "SOFTWARE\\FamiliarSmartcard\\Attestation";
+
+const VALUE_VAULT: &str = "VaultBlob";
+const VALUE_VAULT_PENDING: &str = "VaultBlob.pending";
+const VALUE_VAULT_BACKUP: &str = "VaultBlob.bak";
+const VALUE_TOUCH_POLICY: &str = "TouchPolicy";
+const VALUE_PINNED_F9: &str = "PinnedF9Fingerprint";
+
 const MAX_DPAPI_BLOB: usize = 4096;
+const SDDL_REVISION_1: u32 = 1;
 
-/// Append a non-secret diagnostic line. Used by the Credential Provider because
-/// LogonUI has no console. The file is writable by SYSTEM/Administrators.
-pub fn debug_log(message: &str) {
-    use std::io::Write;
+/// Protected DACL granting FullControl only to `NT AUTHORITY\SYSTEM` and
+/// `BUILTIN\Administrators`, with container & object inheritance.
+/// Used exclusively for secret registry hives (`HKLM\SOFTWARE\FamiliarSmartcard`).
+const SDDL_SYSTEM_ADMINS_ONLY: PCWSTR = w!("D:PAI(A;OICI;KA;;;SY)(A;OICI;KA;;;BA)");
 
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(r"C:\Windows\Temp\familiar_cp.log")
-    {
-        let _ = writeln!(file, "{timestamp} {message}");
+/// Hardened `Program Files` binary DACL: FullControl for `SYSTEM` and `Administrators`,
+/// ReadAndExecute (`0x1200a9`) only for `Users` (`BU`), `ALL APPLICATION PACKAGES` (`AC`),
+/// and `LOCAL SERVICE` (`LS`) so Windows 10/11 XAML `LogonUI.exe` and AppContainer
+/// brokers can load the COM DLL without granting write access to non-admins.
+const SDDL_PROGRAM_FILES_BINARIES: PCWSTR =
+    w!("D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)(A;OICI;0x1200a9;;;AC)(A;OICI;0x1200a9;;;LS)");
+
+/// Standard COM `HKLM\SOFTWARE\Classes\CLSID` DACL: FullControl for `SYSTEM` and
+/// `Administrators`, Read (`KR`) for `Users`, `ALL APPLICATION PACKAGES`, and `LOCAL SERVICE`.
+const SDDL_COM_CLSID_READABLE: PCWSTR =
+    w!("D:PAI(A;OICI;KA;;;SY)(A;OICI;KA;;;BA)(A;OICI;KR;;;BU)(A;OICI;KR;;;AC)(A;OICI;KR;;;LS)");
+
+/// Safe no-op diagnostic hook in production builds.
+///
+/// Replaces the insecure `C:\Windows\Temp\familiar_cp.log` writer so `SYSTEM`
+/// processes cannot be tricked into following symlinks/junctions or leaking
+/// account metadata to unprivileged local users.
+#[inline]
+pub fn debug_log(_message: &str) {}
+
+struct SecurityDescriptorGuard(PSECURITY_DESCRIPTOR);
+
+impl SecurityDescriptorGuard {
+    fn from_sddl(sddl: PCWSTR) -> Result<Self> {
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: Valid constant SDDL string and out-pointer.
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl,
+                SDDL_REVISION_1,
+                &mut sd,
+                None,
+            )
+        }
+        .map_err(|e| AuthError::Internal(format!("SDDL conversion failed: {}", e.message())))?;
+        Ok(Self(sd))
     }
+
+    fn system_admins_only() -> Result<Self> {
+        Self::from_sddl(SDDL_SYSTEM_ADMINS_ONLY)
+    }
+
+    fn dacl_ptr(&self) -> Result<*const ACL> {
+        let mut present = BOOL(0);
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut defaulted = BOOL(0);
+        // SAFETY: `self.0` was created by `ConvertStringSecurityDescriptorToSecurityDescriptorW`.
+        unsafe { GetSecurityDescriptorDacl(self.0, &mut present, &mut dacl, &mut defaulted) }
+            .map_err(|e| AuthError::Internal(format!("GetSecurityDescriptorDacl failed: {e}")))?;
+        if !present.as_bool() || dacl.is_null() {
+            return Err(AuthError::Internal("SDDL produced null DACL".into()));
+        }
+        Ok(dacl as *const ACL)
+    }
+}
+
+impl Drop for SecurityDescriptorGuard {
+    fn drop(&mut self) {
+        if !self.0 .0.is_null() {
+            // SAFETY: `self.0` was allocated with `LocalAlloc` by Advapi32.
+            unsafe {
+                let _ = LocalFree(Some(HLOCAL(self.0 .0)));
+            }
+            self.0 = PSECURITY_DESCRIPTOR::default();
+        }
+    }
+}
+
+/// Apply hardened `Program Files` binary permissions (`SY`/`BA` FullControl,
+/// `BU`/`AC`/`LS` ReadAndExecute) to an installation directory or binary file.
+pub fn apply_program_files_binary_acl(path: &Path) -> Result<()> {
+    let sd = SecurityDescriptorGuard::from_sddl(SDDL_PROGRAM_FILES_BINARIES)?;
+    let dacl = sd.dacl_ptr()?;
+    let wide = to_wide(&path.to_string_lossy());
+    // SAFETY: `wide` is NUL-terminated and `dacl` outlives the call.
+    let err = unsafe {
+        SetNamedSecurityInfoW(
+            PCWSTR(wide.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(dacl),
+            None,
+        )
+    };
+    if err != ERROR_SUCCESS {
+        return Err(AuthError::Internal(format!(
+            "SetNamedSecurityInfoW failed on {}: 0x{:08X}",
+            path.display(),
+            err.0
+        )));
+    }
+    Ok(())
+}
+
+/// Ensure a COM `HKLM\SOFTWARE\Classes\CLSID\{...}` subkey is readable by LogonUI
+/// and AppContainer brokers (`BU`/`AC`/`LS` Read) while writable only by `SY`/`BA`.
+pub fn restore_com_clsid_acl(subkey: &str) -> Result<()> {
+    let sd = SecurityDescriptorGuard::from_sddl(SDDL_COM_CLSID_READABLE)?;
+    let dacl = sd.dacl_ptr()?;
+    let object_name = to_wide(&format!("MACHINE\\{subkey}"));
+    // SAFETY: `object_name` is NUL-terminated and `dacl` outlives the call.
+    let err = unsafe {
+        SetNamedSecurityInfoW(
+            PCWSTR(object_name.as_ptr()),
+            SE_REGISTRY_KEY,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(dacl),
+            None,
+        )
+    };
+    if err != ERROR_SUCCESS {
+        return Err(AuthError::Registry(err.0 as i32));
+    }
+    Ok(())
+}
+
+/// Apply the protected `SYSTEM` + `Administrators` DACL to an existing `HKLM` subkey.
+pub fn harden_hklm_subkey_acl(subkey: &str) -> Result<()> {
+    let sd = SecurityDescriptorGuard::system_admins_only()?;
+    let dacl = sd.dacl_ptr()?;
+    let object_name = to_wide(&format!("MACHINE\\{subkey}"));
+    // SAFETY: `object_name` is NUL-terminated and `dacl` outlives the call.
+    let err = unsafe {
+        SetNamedSecurityInfoW(
+            PCWSTR(object_name.as_ptr()),
+            SE_REGISTRY_KEY,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(dacl),
+            None,
+        )
+    };
+    if err != ERROR_SUCCESS {
+        return Err(AuthError::Registry(err.0 as i32));
+    }
+    Ok(())
 }
 
 fn to_wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-fn subkey_for_sid(sid: &str) -> Vec<u16> {
-    to_wide(&format!("{REG_PREFIX}{sid}"))
+fn validate_sid_token(sid: &str) -> Result<()> {
+    if sid.is_empty()
+        || sid.len() > 184
+        || !sid.starts_with("S-1-")
+        || !sid
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '-' || c == 'S')
+    {
+        return Err(AuthError::Vault("malformed SID string".into()));
+    }
+    Ok(())
+}
+
+fn user_subkey_str(sid: &str) -> Result<String> {
+    validate_sid_token(sid)?;
+    Ok(format!("{USERS_SUBKEY}\\{sid}"))
 }
 
 fn entropy_for_sid(sid: &str) -> Vec<u8> {
     format!("FamiliarSmartcard/v1/{sid}").into_bytes()
 }
 
-pub fn read_vault(sid: &str) -> Result<Option<VaultBlob>> {
-    let subkey = subkey_for_sid(sid);
-    let value = to_wide(VALUE_NAME);
-    debug_log(&format!("read_vault sid={sid}"));
+struct RegKeyGuard(HKEY);
 
+impl Drop for RegKeyGuard {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            // SAFETY: `self.0` was opened/created via Win32 Registry API.
+            unsafe {
+                let _ = RegCloseKey(self.0);
+            }
+        }
+    }
+}
+
+fn create_secured_hklm_key(subkey: &str) -> Result<RegKeyGuard> {
+    let sd = SecurityDescriptorGuard::system_admins_only()?;
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd.0 .0,
+        bInheritHandle: BOOL(0),
+    };
+    let subkey_w = to_wide(subkey);
+    let mut key = HKEY::default();
+    // SAFETY: `subkey_w` is NUL-terminated; `sa` and `sd` outlive `RegCreateKeyExW`.
+    let status = unsafe {
+        RegCreateKeyExW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(subkey_w.as_ptr()),
+            None,
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE | KEY_READ | KEY_SET_VALUE | KEY_WOW64_64KEY,
+            Some(&sa),
+            &mut key,
+            None,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(AuthError::Registry(status.0 as i32));
+    }
+    Ok(RegKeyGuard(key))
+}
+
+/// Ensure the root `HKLM\SOFTWARE\FamiliarSmartcard` hierarchy exists and has
+/// `SYSTEM` + `Administrators` protected ACLs (even if an unhardened key pre-existed).
+pub fn ensure_secured_vault_hierarchy() -> Result<()> {
+    let _root = create_secured_hklm_key(ROOT_SUBKEY)?;
+    harden_hklm_subkey_acl(ROOT_SUBKEY)?;
+    let _users = create_secured_hklm_key(USERS_SUBKEY)?;
+    let _att = create_secured_hklm_key(ATTESTATION_SUBKEY)?;
+    Ok(())
+}
+
+/// Fast existence check used by the Credential Provider to filter unbound user tiles
+/// without invoking DPAPI during tile enumeration.
+pub fn vault_exists(sid: &str) -> bool {
+    let Ok(subkey) = user_subkey_str(sid) else {
+        return false;
+    };
+    let subkey_w = to_wide(&subkey);
+    let value_w = to_wide(VALUE_VAULT);
     let mut len = 0u32;
+    // SAFETY: Queries value length only.
     let status = unsafe {
         RegGetValueW(
             HKEY_LOCAL_MACHINE,
-            PCWSTR(subkey.as_ptr()),
-            PCWSTR(value.as_ptr()),
+            PCWSTR(subkey_w.as_ptr()),
+            PCWSTR(value_w.as_ptr()),
             RRF_RT_REG_BINARY,
             None,
             None,
             Some(&mut len),
         )
     };
-    debug_log(&format!(
-        "read_vault first status=0x{:08X} len={len}",
-        status.0
-    ));
+    status == ERROR_SUCCESS && len > 0 && (len as usize) <= MAX_DPAPI_BLOB
+}
+
+/// Read the optional `TouchPolicy` hint (`0x01` NEVER, `0x02` ALWAYS, `0x03` CACHED)
+/// stored alongside the user's vault to select an appropriate helper timeout.
+pub fn read_touch_policy(sid: &str) -> Option<u8> {
+    let subkey = user_subkey_str(sid).ok()?;
+    let subkey_w = to_wide(&subkey);
+    let value_w = to_wide(VALUE_TOUCH_POLICY);
+    let mut raw = 0u32;
+    let mut len = size_of::<u32>() as u32;
+    // SAFETY: `raw` is a valid 4-byte buffer for `RRF_RT_REG_DWORD`.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(subkey_w.as_ptr()),
+            PCWSTR(value_w.as_ptr()),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut raw as *mut u32 as *mut c_void),
+            Some(&mut len),
+        )
+    };
+    if status == ERROR_SUCCESS {
+        u8::try_from(raw).ok()
+    } else {
+        None
+    }
+}
+
+pub fn write_touch_policy(sid: &str, touch_policy: u8) -> Result<()> {
+    ensure_secured_vault_hierarchy()?;
+    let subkey = user_subkey_str(sid)?;
+    let key = create_secured_hklm_key(&subkey)?;
+    let value_w = to_wide(VALUE_TOUCH_POLICY);
+    let dword = (touch_policy as u32).to_le_bytes();
+    // SAFETY: `key.0` is open with `KEY_WRITE`; `dword` is 4 bytes.
+    let status = unsafe {
+        RegSetValueExW(
+            key.0,
+            PCWSTR(value_w.as_ptr()),
+            None,
+            REG_DWORD,
+            Some(&dword),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(AuthError::Registry(status.0 as i32));
+    }
+    Ok(())
+}
+
+fn read_raw_reg_binary(subkey: &str, value_name: &str, max_len: usize) -> Result<Option<Vec<u8>>> {
+    let subkey_w = to_wide(subkey);
+    let value_w = to_wide(value_name);
+
+    let mut len = 0u32;
+    // SAFETY: First call queries byte length.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(subkey_w.as_ptr()),
+            PCWSTR(value_w.as_ptr()),
+            RRF_RT_REG_BINARY,
+            None,
+            None,
+            Some(&mut len),
+        )
+    };
 
     if status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND {
         return Ok(None);
@@ -77,40 +370,63 @@ pub fn read_vault(sid: &str) -> Result<Option<VaultBlob>> {
     if status != ERROR_SUCCESS {
         return Err(AuthError::Registry(status.0 as i32));
     }
-    if len as usize > MAX_DPAPI_BLOB {
-        return Err(AuthError::Vault("vault blob exceeds 4096 bytes".into()));
+    if len == 0 || (len as usize) > max_len {
+        return Err(AuthError::Vault(format!(
+            "registry blob '{value_name}' exceeds {max_len} bytes or is empty"
+        )));
     }
 
     let mut buffer = vec![0u8; len as usize];
+    // SAFETY: `buffer` has `len` bytes capacity.
     let status = unsafe {
         RegGetValueW(
             HKEY_LOCAL_MACHINE,
-            PCWSTR(subkey.as_ptr()),
-            PCWSTR(value.as_ptr()),
+            PCWSTR(subkey_w.as_ptr()),
+            PCWSTR(value_w.as_ptr()),
             RRF_RT_REG_BINARY,
             None,
             Some(buffer.as_mut_ptr() as *mut c_void),
             Some(&mut len),
         )
     };
-    debug_log(&format!(
-        "read_vault second status=0x{:08X} len={len}",
-        status.0
-    ));
     if status != ERROR_SUCCESS {
         return Err(AuthError::Registry(status.0 as i32));
     }
-    buffer.truncate(len as usize);
+    buffer.truncate((len as usize).min(buffer.len()));
+    Ok(Some(buffer))
+}
 
+fn write_raw_reg_binary(key: HKEY, value_name: &str, bytes: &[u8]) -> Result<()> {
+    let value_w = to_wide(value_name);
+    // SAFETY: `key` is open with `KEY_WRITE`; `bytes` outlives the call.
+    let status =
+        unsafe { RegSetValueExW(key, PCWSTR(value_w.as_ptr()), None, REG_BINARY, Some(bytes)) };
+    if status != ERROR_SUCCESS {
+        return Err(AuthError::Registry(status.0 as i32));
+    }
+    Ok(())
+}
+
+fn delete_reg_value_ignore_missing(key: HKEY, value_name: &str) {
+    let value_w = to_wide(value_name);
+    // SAFETY: `key` is open with `KEY_SET_VALUE`.
+    unsafe {
+        let _ = RegDeleteValueW(key, PCWSTR(value_w.as_ptr()));
+    }
+}
+
+pub fn read_vault(sid: &str) -> Result<Option<VaultBlob>> {
+    let subkey = user_subkey_str(sid)?;
+    let Some(buffer) = read_raw_reg_binary(&subkey, VALUE_VAULT, MAX_DPAPI_BLOB)? else {
+        return Ok(None);
+    };
     let entropy = entropy_for_sid(sid);
     let encoded = dpapi::unprotect(&buffer, &entropy)?;
     let vault = VaultBlob::decode(&encoded)?;
-    debug_log("read_vault dpapi+decode ok");
     Ok(Some(vault))
 }
 
-pub fn write_vault(sid: &str, vault: &VaultBlob) -> Result<()> {
-    debug_log(&format!("write_vault sid={sid}"));
+fn encode_and_protect_vault(sid: &str, vault: &VaultBlob) -> Result<(Vec<u8>, Vec<u8>)> {
     let encoded = vault.encode()?;
     let entropy = entropy_for_sid(sid);
     let protected = dpapi::protect(&encoded, &entropy)?;
@@ -119,42 +435,103 @@ pub fn write_vault(sid: &str, vault: &VaultBlob) -> Result<()> {
             "protected vault exceeds 4096 bytes".into(),
         ));
     }
+    Ok((encoded, protected))
+}
 
-    let subkey = subkey_for_sid(sid);
-    let value = to_wide(VALUE_NAME);
+/// Stage a pending vault and back up any existing active vault before rotating
+/// the Windows account password.
+pub fn stage_pending_vault_with_backup(sid: &str, pending_vault: &VaultBlob) -> Result<()> {
+    ensure_secured_vault_hierarchy()?;
+    let subkey = user_subkey_str(sid)?;
+    let key = create_secured_hklm_key(&subkey)?;
 
-    let mut key = HKEY::default();
-    let status = unsafe {
-        RegCreateKeyExW(
-            HKEY_LOCAL_MACHINE,
-            PCWSTR(subkey.as_ptr()),
-            None,
-            PCWSTR::null(),
-            REG_OPTION_NON_VOLATILE,
-            KEY_WRITE | KEY_WOW64_64KEY,
-            None,
-            &mut key,
-            None,
-        )
-    };
-    if status != ERROR_SUCCESS {
-        return Err(AuthError::Registry(status.0 as i32));
+    if let Some(existing) = read_raw_reg_binary(&subkey, VALUE_VAULT, MAX_DPAPI_BLOB)? {
+        write_raw_reg_binary(key.0, VALUE_VAULT_BACKUP, &existing)?;
     }
-
-    let status = unsafe {
-        RegSetValueExW(
-            key,
-            PCWSTR(value.as_ptr()),
-            None,
-            REG_BINARY,
-            Some(&protected),
-        )
-    };
-    unsafe {
-        let _ = RegCloseKey(key);
-    }
-    if status != ERROR_SUCCESS {
-        return Err(AuthError::Registry(status.0 as i32));
-    }
+    let (_, protected) = encode_and_protect_vault(sid, pending_vault)?;
+    write_raw_reg_binary(key.0, VALUE_VAULT_PENDING, &protected)?;
     Ok(())
+}
+
+/// Write `vault` to `VaultBlob`, immediately read it back through DPAPI + decode
+/// to verify storage integrity, and clean up `VaultBlob.pending`.
+pub fn write_vault(sid: &str, vault: &VaultBlob) -> Result<()> {
+    ensure_secured_vault_hierarchy()?;
+    let subkey = user_subkey_str(sid)?;
+    let key = create_secured_hklm_key(&subkey)?;
+
+    let (expected_encoded, protected) = encode_and_protect_vault(sid, vault)?;
+    write_raw_reg_binary(key.0, VALUE_VAULT, &protected)?;
+
+    // Read-back verification guarantees the persisted registry value decrypts cleanly.
+    let read_back = read_raw_reg_binary(&subkey, VALUE_VAULT, MAX_DPAPI_BLOB)?
+        .ok_or_else(|| AuthError::Vault("vault read-back returned empty".into()))?;
+    let unprotected = dpapi::unprotect(&read_back, &entropy_for_sid(sid))?;
+    if !constant_time_eq(&unprotected, &expected_encoded) {
+        return Err(AuthError::Vault(
+            "vault read-back verification mismatch".into(),
+        ));
+    }
+    let _ = VaultBlob::decode(&unprotected)?;
+
+    delete_reg_value_ignore_missing(key.0, VALUE_VAULT_PENDING);
+    Ok(())
+}
+
+/// Read the machine-pinned `0xF9` attestation CA public-key SHA-256 fingerprint.
+pub fn read_pinned_f9() -> Result<Option<[u8; 32]>> {
+    let Some(bytes) = read_raw_reg_binary(ATTESTATION_SUBKEY, VALUE_PINNED_F9, 64)? else {
+        return Ok(None);
+    };
+    if bytes.len() != 32 {
+        return Err(AuthError::Attestation(
+            "corrupted pinned 0xF9 fingerprint in registry".into(),
+        ));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(Some(out))
+}
+
+/// Pin the `0xF9` attestation CA public-key SHA-256 fingerprint under secured `HKLM`.
+pub fn write_pinned_f9(fingerprint: &[u8; 32]) -> Result<()> {
+    ensure_secured_vault_hierarchy()?;
+    let key = create_secured_hklm_key(ATTESTATION_SUBKEY)?;
+    write_raw_reg_binary(key.0, VALUE_PINNED_F9, fingerprint)
+}
+
+/// Clear the pinned `0xF9` attestation CA fingerprint (used after `rsk otp burn` or card replacement).
+/// Returns `true` if a previously pinned value existed and was removed.
+pub fn clear_pinned_f9() -> Result<bool> {
+    ensure_secured_vault_hierarchy()?;
+    let existed = read_raw_reg_binary(ATTESTATION_SUBKEY, VALUE_PINNED_F9, 64)?.is_some();
+    let key = create_secured_hklm_key(ATTESTATION_SUBKEY)?;
+    delete_reg_value_ignore_missing(key.0, VALUE_PINNED_F9);
+    Ok(existed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sddl_builds_valid_dacl() {
+        for sddl in [
+            SDDL_SYSTEM_ADMINS_ONLY,
+            SDDL_PROGRAM_FILES_BINARIES,
+            SDDL_COM_CLSID_READABLE,
+        ] {
+            let sd = SecurityDescriptorGuard::from_sddl(sddl).unwrap();
+            let dacl = sd.dacl_ptr().unwrap();
+            assert!(!dacl.is_null());
+        }
+    }
+
+    #[test]
+    fn sid_validator_rejects_traversal_and_garbage() {
+        assert!(validate_sid_token("S-1-5-21-123456-7890-1001").is_ok());
+        assert!(validate_sid_token("").is_err());
+        assert!(validate_sid_token("S-1-5-21\\..\\Evil").is_err());
+        assert!(validate_sid_token("Administrator").is_err());
+    }
 }

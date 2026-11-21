@@ -3,14 +3,18 @@
 //! The vault contains only ciphertext and public metadata. It must never
 //! contain `Eph_Priv_enroll`, the DEK, the KEK, or the Windows password.
 
+#![forbid(unsafe_code)]
+
+use crate::crypto::{aes_gcm_encrypt, random_nonce};
 use crate::error::{AuthError, Result};
+use zeroize::Zeroizing;
 
 pub const VAULT_MAGIC: [u8; 4] = *b"FSC1";
 pub const VAULT_VERSION: u8 = 1;
 pub const APP_PIV: u8 = 1;
 pub const ALG_P256: u8 = 1;
 pub const PASSWORD_PADDED_LEN: usize = 256;
-pub const PASSWORD_LAST_SET_TOLERANCE_SECS: u64 = 5;
+pub const PASSWORD_LAST_SET_TOLERANCE_SECS: u64 = 10;
 
 const MAX_EPH_PUB: usize = 133;
 const MAX_WRAPPED_DEK: usize = 128;
@@ -132,13 +136,47 @@ impl VaultBlob {
             created_at,
         })
     }
+
+    /// Re-encrypt `password` under an already-verified `dek` and a new static
+    /// `password_last_set` timestamp using a fresh random AES-GCM nonce.
+    ///
+    /// Used in Phase D of two-phase atomic password rotation after `NetUserSetInfo`
+    /// updates the account password, avoiding a second smart-card touch/PIN cycle.
+    pub fn reencrypt_password_with_dek(
+        &self,
+        dek: &[u8; 32],
+        password: &str,
+        sid: &str,
+        username: &str,
+        computer: &str,
+        new_password_last_set: u64,
+    ) -> Result<Self> {
+        let padded = pad_password(password)?;
+        let fresh_nonce = random_nonce();
+        let aad = aad_password(&AadPasswordParams {
+            version: self.version,
+            app: self.app,
+            slot: self.slot,
+            alg: self.alg,
+            fingerprint: &self.card_pub_fingerprint,
+            sid,
+            username,
+            computer,
+            password_last_set: new_password_last_set,
+        });
+        let (ciphertext, tag) = aes_gcm_encrypt(dek, &fresh_nonce, padded.as_ref(), &aad)?;
+        let mut updated = self.clone();
+        updated.nonce = fresh_nonce;
+        updated.ciphertext = ciphertext;
+        updated.tag = tag;
+        updated.password_last_set = new_password_last_set;
+        Ok(updated)
+    }
 }
 
 fn push_bytes(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
-    if value.len() > u16::MAX as usize {
-        return Err(AuthError::Vault("field too long".into()));
-    }
-    out.extend_from_slice(&(value.len() as u16).to_le_bytes());
+    let len = u16::try_from(value.len()).map_err(|_| AuthError::Vault("field too long".into()))?;
+    out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(value);
     Ok(())
 }
@@ -167,7 +205,10 @@ impl<'a> Reader<'a> {
     }
 
     fn fixed<const N: usize>(&mut self) -> Result<[u8; N]> {
-        let end = self.pos + N;
+        let end = self
+            .pos
+            .checked_add(N)
+            .ok_or_else(|| AuthError::Vault("vault offset overflow".into()))?;
         if end > self.data.len() {
             return Err(AuthError::Vault("truncated vault".into()));
         }
@@ -190,7 +231,10 @@ impl<'a> Reader<'a> {
         if len > max {
             return Err(AuthError::Vault("vault field exceeds limit".into()));
         }
-        let end = self.pos + len;
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or_else(|| AuthError::Vault("vault offset overflow".into()))?;
         if end > self.data.len() {
             return Err(AuthError::Vault("truncated vault".into()));
         }
@@ -202,19 +246,29 @@ impl<'a> Reader<'a> {
 
 fn push_lp(out: &mut Vec<u8>, value: &str) {
     let bytes = value.as_bytes();
-    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    out.extend_from_slice(bytes);
+    let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&bytes[..len as usize]);
 }
 
 fn normalize_user(value: &str) -> String {
-    // Windows account names are case-insensitive. Normalize consistently at
-    // enrollment and login so the AAD is deterministic.
     value.to_lowercase()
 }
 
 fn normalize_computer(value: &str) -> String {
-    // NetBIOS computer names are case-insensitive.
     value.to_uppercase()
+}
+
+pub struct AadPasswordParams<'a> {
+    pub version: u8,
+    pub app: u8,
+    pub slot: u8,
+    pub alg: u8,
+    pub fingerprint: &'a [u8; 32],
+    pub sid: &'a str,
+    pub username: &'a str,
+    pub computer: &'a str,
+    pub password_last_set: u64,
 }
 
 /// AAD for the password ciphertext.
@@ -222,25 +276,15 @@ fn normalize_computer(value: &str) -> String {
 /// Variable-length fields use a u32 little-endian length prefix. The timestamp
 /// is the static value stored in the vault; never a value recomputed during
 /// login.
-pub fn aad_password(
-    version: u8,
-    app: u8,
-    slot: u8,
-    alg: u8,
-    fingerprint: &[u8; 32],
-    sid: &str,
-    username: &str,
-    computer: &str,
-    password_last_set: u64,
-) -> Vec<u8> {
+pub fn aad_password(params: &AadPasswordParams<'_>) -> Vec<u8> {
     let mut aad = Vec::new();
     aad.extend_from_slice(b"FamiliarSmartcard/v2/aad-password\0");
-    aad.extend_from_slice(&[version, app, slot, alg]);
-    aad.extend_from_slice(fingerprint);
-    push_lp(&mut aad, sid);
-    push_lp(&mut aad, &normalize_user(username));
-    push_lp(&mut aad, &normalize_computer(computer));
-    aad.extend_from_slice(&password_last_set.to_le_bytes());
+    aad.extend_from_slice(&[params.version, params.app, params.slot, params.alg]);
+    aad.extend_from_slice(params.fingerprint);
+    push_lp(&mut aad, params.sid);
+    push_lp(&mut aad, &normalize_user(params.username));
+    push_lp(&mut aad, &normalize_computer(params.computer));
+    aad.extend_from_slice(&params.password_last_set.to_le_bytes());
     aad
 }
 
@@ -261,7 +305,7 @@ pub fn aad_wrap(
     aad
 }
 
-/// Windows reports `usri3_password_age` as relative seconds; `now - age`
+/// Windows reports `usri1_password_age` as relative seconds; `now - age`
 /// contains second-boundary jitter. Compare the derived timestamp with the
 /// static enrollment value using a small tolerance.
 pub fn password_last_set_matches(stored: u64, current: u64) -> bool {
@@ -269,13 +313,14 @@ pub fn password_last_set_matches(stored: u64, current: u64) -> bool {
 }
 
 /// Encode a UTF-16LE password with a 2-byte length prefix and zero padding.
-pub fn pad_password(password: &str) -> Result<[u8; PASSWORD_PADDED_LEN]> {
-    let utf16: Vec<u16> = password.encode_utf16().collect();
+/// All intermediate and returned buffers are wrapped in `Zeroizing`.
+pub fn pad_password(password: &str) -> Result<Zeroizing<[u8; PASSWORD_PADDED_LEN]>> {
+    let utf16: Zeroizing<Vec<u16>> = Zeroizing::new(password.encode_utf16().collect());
     if utf16.len() > 127 {
         return Err(AuthError::Vault("Windows password too long".into()));
     }
     let byte_len = utf16.len() * 2;
-    let mut out = [0u8; PASSWORD_PADDED_LEN];
+    let mut out = Zeroizing::new([0u8; PASSWORD_PADDED_LEN]);
     out[..2].copy_from_slice(&(byte_len as u16).to_le_bytes());
     for (i, unit) in utf16.iter().enumerate() {
         let offset = 2 + i * 2;
@@ -284,8 +329,8 @@ pub fn pad_password(password: &str) -> Result<[u8; PASSWORD_PADDED_LEN]> {
     Ok(out)
 }
 
-/// Decode the padded UTF-16LE password.
-pub fn unpad_password(padded: &[u8]) -> Result<String> {
+/// Decode the padded UTF-16LE password inside `Zeroizing` buffers.
+pub fn unpad_password(padded: &[u8]) -> Result<Zeroizing<String>> {
     if padded.len() != PASSWORD_PADDED_LEN {
         return Err(AuthError::Vault("bad padded password length".into()));
     }
@@ -293,12 +338,14 @@ pub fn unpad_password(padded: &[u8]) -> Result<String> {
     if byte_len > 254 || byte_len % 2 != 0 || 2 + byte_len > padded.len() {
         return Err(AuthError::Vault("bad password length prefix".into()));
     }
-    let mut units = Vec::with_capacity(byte_len / 2);
+    let mut units: Zeroizing<Vec<u16>> = Zeroizing::new(Vec::with_capacity(byte_len / 2));
     for i in 0..(byte_len / 2) {
         let offset = 2 + i * 2;
         units.push(u16::from_le_bytes([padded[offset], padded[offset + 1]]));
     }
-    String::from_utf16(&units).map_err(|_| AuthError::Vault("invalid UTF-16 password".into()))
+    let decoded = String::from_utf16(&units)
+        .map_err(|_| AuthError::Vault("invalid UTF-16 password".into()))?;
+    Ok(Zeroizing::new(decoded))
 }
 
 #[cfg(test)]
@@ -345,7 +392,10 @@ mod tests {
     #[test]
     fn password_padding_roundtrip() {
         let padded = pad_password("pässwörd-123").unwrap();
-        assert_eq!(unpad_password(&padded).unwrap(), "pässwörd-123");
+        assert_eq!(
+            unpad_password(&padded[..]).unwrap().as_str(),
+            "pässwörd-123"
+        );
     }
 
     #[test]
@@ -358,64 +408,64 @@ mod tests {
     #[test]
     fn aad_has_no_variable_length_collision() {
         let fingerprint = [0x11; 32];
-        let a = aad_password(
-            VAULT_VERSION,
-            APP_PIV,
-            0x9D,
-            ALG_P256,
-            &fingerprint,
-            "S-1-5-21-1",
-            "alice",
-            "pc1",
-            123,
-        );
-        let b = aad_password(
-            VAULT_VERSION,
-            APP_PIV,
-            0x9D,
-            ALG_P256,
-            &fingerprint,
-            "S-1-5-21-1",
-            "alic",
-            "epc1",
-            123,
-        );
+        let a = aad_password(&AadPasswordParams {
+            version: VAULT_VERSION,
+            app: APP_PIV,
+            slot: 0x9D,
+            alg: ALG_P256,
+            fingerprint: &fingerprint,
+            sid: "S-1-5-21-1",
+            username: "alice",
+            computer: "pc1",
+            password_last_set: 123,
+        });
+        let b = aad_password(&AadPasswordParams {
+            version: VAULT_VERSION,
+            app: APP_PIV,
+            slot: 0x9D,
+            alg: ALG_P256,
+            fingerprint: &fingerprint,
+            sid: "S-1-5-21-1",
+            username: "alic",
+            computer: "epc1",
+            password_last_set: 123,
+        });
         assert_ne!(a, b);
     }
 
     #[test]
     fn password_last_set_tolerance() {
-        assert!(password_last_set_matches(1000, 1005));
-        assert!(password_last_set_matches(1000, 995));
-        assert!(!password_last_set_matches(1000, 1006));
-        assert!(!password_last_set_matches(1000, 994));
+        assert!(password_last_set_matches(1000, 1010));
+        assert!(password_last_set_matches(1000, 990));
+        assert!(!password_last_set_matches(1000, 1011));
+        assert!(!password_last_set_matches(1000, 989));
     }
 
     #[test]
     fn timestamp_is_part_of_aad() {
         let fingerprint = [0x11; 32];
-        let a = aad_password(
-            VAULT_VERSION,
-            APP_PIV,
-            0x9D,
-            ALG_P256,
-            &fingerprint,
-            "S-1-5-21-1",
-            "alice",
-            "pc1",
-            123,
-        );
-        let b = aad_password(
-            VAULT_VERSION,
-            APP_PIV,
-            0x9D,
-            ALG_P256,
-            &fingerprint,
-            "S-1-5-21-1",
-            "alice",
-            "pc1",
-            124,
-        );
+        let a = aad_password(&AadPasswordParams {
+            version: VAULT_VERSION,
+            app: APP_PIV,
+            slot: 0x9D,
+            alg: ALG_P256,
+            fingerprint: &fingerprint,
+            sid: "S-1-5-21-1",
+            username: "alice",
+            computer: "pc1",
+            password_last_set: 123,
+        });
+        let b = aad_password(&AadPasswordParams {
+            version: VAULT_VERSION,
+            app: APP_PIV,
+            slot: 0x9D,
+            alg: ALG_P256,
+            fingerprint: &fingerprint,
+            sid: "S-1-5-21-1",
+            username: "alice",
+            computer: "pc1",
+            password_last_set: 124,
+        });
         assert_ne!(a, b);
     }
 }
