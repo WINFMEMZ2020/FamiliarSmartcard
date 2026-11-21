@@ -32,8 +32,12 @@ Release binaries in `target\release\`:
 ## CLI Commands
 
 ```powershell
-# Read-only probe: checks PIN/PUK retries, slot 0x9D policy (P-256, PIN ALWAYS, On-card) & 0xF9 attestation
+# Read-only probe: checks PIN/PUK retries, 0x9B mgmt key, slot 0x9D policy & 0xF9 attestation
 .\familiar-enroll.exe --probe
+
+# Provision on-card ECC P-256 0x9D key with custom Touch Policy (always or never) + 0x9E anti-phishing key
+.\familiar-enroll.exe --provision-card always --pin <PIV-PIN>
+.\familiar-enroll.exe --provision-card never  --pin <PIV-PIN>
 
 # Stateless crypto self-test (no registry writes, no Windows password change)
 .\familiar-enroll.exe --card-selftest <PIV-PIN>
@@ -56,6 +60,7 @@ Release binaries in `target\release\`:
 Launch `familiar-enroll.exe` (requests UAC elevation automatically):
 
 1. **`Set up & rotate password (Recommended)`**:
+   - Optionally provisions a fresh on-card `0x9D` ECC P-256 key directly inside the workflow with your choice of **`Touch = ALWAYS`** (physical touch required) or **`Touch = NEVER`** (PIN only), optionally provisions **`Slot 0x9E` (`PIN=NEVER`)** for pre-PIN hardware anti-phishing, and supports custom or rotated `0x9B` Management Keys (no external `ykman` required).
    - Validates the local Workgroup account, verifies `0x9D` (`ECCP256`, `PIN ALWAYS`, `On-card` when metadata is exposed, or standard `5F C1 0B` X.509 certificate) and `0xF9` attestation if supported, generates a **36-character unambiguous random password** (`XXXX-XXXX-...`), and runs a real card unlock self-test **before** changing your Windows password.
    - Displays (and optionally prints via direct GDI) the offline recovery sheet and requires typing the last 6 characters to confirm.
    - Atomically rotates the local password (`UF_DONT_EXPIRE_PASSWD`), commits the verified `VaultBlob`, and installs/registers the Credential Provider and helper in `C:\Program Files\FamiliarSmartcard\`.

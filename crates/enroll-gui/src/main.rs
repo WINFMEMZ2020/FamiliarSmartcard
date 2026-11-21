@@ -20,15 +20,18 @@ use scard_core::enroll::{
     AttestationPolicy, EnrollOptions,
 };
 use scard_core::piv::{
-    PinPukMetadata, ORIGIN_GENERATED, ORIGIN_IMPORTED, PIN_POLICY_ALWAYS, PIN_POLICY_NEVER,
-    PIN_POLICY_ONCE, TOUCH_POLICY_ALWAYS, TOUCH_POLICY_CACHED, TOUCH_POLICY_NEVER,
+    MgmtKeyMetadata, PinPukMetadata, ALG_3DES, ALG_AES_128, ALG_AES_192, ALG_AES_256,
+    ORIGIN_GENERATED, ORIGIN_IMPORTED, PIN_POLICY_ALWAYS, PIN_POLICY_NEVER, PIN_POLICY_ONCE,
+    TOUCH_POLICY_ALWAYS, TOUCH_POLICY_CACHED, TOUCH_POLICY_NEVER,
 };
 use scard_core::storage::{
     clear_card_auth_9e_pub, clear_last_attempt_cooldown, clear_pinned_f9, purge_vault_backup,
     read_card_auth_9e_pub, read_pinned_f9, read_vault, stage_pending_vault_with_backup,
     write_card_auth_9e_pub, write_touch_policy, write_vault,
 };
-use scard_core::VaultBlob;
+use scard_core::{
+    card_has_9d_key, parse_mgmt_key_hex, provision_card, CardProvisionOptions, VaultBlob,
+};
 use std::ffi::c_void;
 use std::mem::size_of;
 use windows::core::{w, PCWSTR};
@@ -64,20 +67,46 @@ const ID_REPIN_ROOT: usize = 1005;
 const ID_REGISTER: usize = 1006;
 const ID_CLEAR: usize = 1007;
 const ID_MANAGE_PUK: usize = 1008;
+const ID_RADIO_KEEP_KEY: usize = 1009;
+const ID_RADIO_TOUCH_ALWAYS: usize = 1010;
+const ID_RADIO_TOUCH_NEVER: usize = 1011;
+const ID_CHK_PROVISION_9E: usize = 1012;
 
 const WM_WORKER_RESULT: u32 = WM_APP + 10;
+const WM_WORKER_STATUS: u32 = WM_APP + 11;
 
 const WINDOW_TITLE: &str = "Familiar Smartcard — Setup & Diagnostics";
 const EM_SETPASSWORDCHAR: u32 = 0x00CC;
 const PASSWORD_CHAR: usize = 0x25CF;
+const BM_GETCHECK: u32 = 0x00F0;
+const BM_SETCHECK: u32 = 0x00F1;
+const BST_UNCHECKED: usize = 0;
+const BST_CHECKED: usize = 1;
+const STYLE_AUTOCHECKBOX: WINDOW_STYLE = WINDOW_STYLE(0x0003);
+const STYLE_AUTORADIO: WINDOW_STYLE = WINDOW_STYLE(0x0009);
+const STYLE_GROUP: WINDOW_STYLE = WINDOW_STYLE(0x0002_0000);
 
 struct AppState {
     status: HWND,
     output: HWND,
     pin: HWND,
     password: HWND,
+    radio_keep: HWND,
+    radio_touch_always: HWND,
+    radio_touch_never: HWND,
+    chk_9e: HWND,
+    mgmt_cur: HWND,
+    mgmt_new: HWND,
     buttons: [HWND; 8],
+    user_touched_provision_mode: bool,
     busy: bool,
+}
+
+struct ProvisionPlan {
+    touch_policy_9d: u8,
+    provision_9e: bool,
+    current_mgmt_hex: Zeroizing<String>,
+    new_mgmt_hex: Zeroizing<String>,
 }
 
 struct PreparedRotation {
@@ -92,12 +121,14 @@ struct PreparedRotation {
     pin_is_default: bool,
     puk_is_default: bool,
     card_auth_9e_pub: Option<Vec<u8>>,
+    mgmt_rotated: bool,
 }
 
 enum WorkerOutcome {
     ProbeDone {
         status: String,
         output: Option<String>,
+        piv_card_without_9d: bool,
     },
     SimpleDone {
         status: String,
@@ -146,6 +177,9 @@ fn main() -> windows::core::Result<()> {
                 };
                 return change_puk_cli(cur_puk, new_puk);
             }
+            "--provision-card" => {
+                return provision_card_cli(&args[2..]);
+            }
             _ => {
                 eprintln!("Unknown option: {flag}\n");
                 print_cli_help();
@@ -188,7 +222,7 @@ fn main() -> windows::core::Result<()> {
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             920,
-            730,
+            830,
             None,
             None,
             Some(hinstance),
@@ -211,7 +245,9 @@ fn print_cli_help() {
         "Familiar Smartcard — PIV Smart Card Setup & Diagnostics\n\n\
          Usage:\n\
          \x20 familiar-enroll.exe                                Launch elevated Win32 setup GUI\n\
-         \x20 familiar-enroll.exe --probe                        Read-only reader, PIN/PUK, 0x9D policy & 0xF9 attestation probe\n\
+         \x20 familiar-enroll.exe --probe                        Read-only reader, PIN/PUK, 0x9B/0x9D policy & 0xF9 attestation probe\n\
+         \x20 familiar-enroll.exe --provision-card <always|never> [--no-9e] [--pin <PIN>] [--mgmt-key <HEX>] [--new-mgmt-key <HEX>]\n\
+         \x20                                                    Generate on-card P-256 0x9D key with Touch ALWAYS or NEVER (+ 0x9E)\n\
          \x20 familiar-enroll.exe --card-selftest <PIN>          Stateless card ECDH/AES-GCM self-test (no registry writes)\n\
          \x20 familiar-enroll.exe --unblock-pin <PUK> <NEW-PIN>  Unblock PIV PIN via PUK (00 2C 00 80) and reset retries to 3\n\
          \x20 familiar-enroll.exe --change-puk <CUR> <NEW>       Change card PUK via 00 24 00 81 (PIV default: 12345678)\n\
@@ -447,6 +483,133 @@ fn change_puk_cli(cur_puk_arg: &str, new_puk_arg: &str) -> windows::core::Result
     }
 }
 
+fn provision_card_cli(rest: &[String]) -> windows::core::Result<()> {
+    let Some(touch_str) = rest.first().map(String::as_str) else {
+        eprintln!(
+            "Usage: familiar-enroll.exe --provision-card <always|never> [--no-9e] [--pin <PIN>] [--mgmt-key <HEX>] [--new-mgmt-key <HEX>]\n"
+        );
+        return Err(windows::core::Error::from_hresult(
+            windows::Win32::Foundation::E_INVALIDARG,
+        ));
+    };
+    let touch_policy_9d = if touch_str.eq_ignore_ascii_case("always") {
+        TOUCH_POLICY_ALWAYS
+    } else if touch_str.eq_ignore_ascii_case("never") {
+        TOUCH_POLICY_NEVER
+    } else {
+        eprintln!("Invalid touch policy '{touch_str}': expected 'always' or 'never'.\n");
+        return Err(windows::core::Error::from_hresult(
+            windows::Win32::Foundation::E_INVALIDARG,
+        ));
+    };
+
+    let mut provision_9e = true;
+    let mut pin_opt: Option<Zeroizing<Vec<u8>>> = None;
+    let mut cur_mgmt: Option<Zeroizing<String>> = None;
+    let mut new_mgmt: Option<Zeroizing<String>> = None;
+
+    let mut idx = 1usize;
+    while idx < rest.len() {
+        match rest[idx].as_str() {
+            "--no-9e" => {
+                provision_9e = false;
+                idx += 1;
+            }
+            "--pin" => {
+                let Some(val) = rest.get(idx + 1) else {
+                    eprintln!("Missing value after --pin\n");
+                    return Err(windows::core::Error::from_hresult(
+                        windows::Win32::Foundation::E_INVALIDARG,
+                    ));
+                };
+                if !valid_pin(val) {
+                    eprintln!("Invalid PIN format: PIV PIN must be 6-8 ASCII digits.\n");
+                    return Err(windows::core::Error::from_hresult(
+                        windows::Win32::Foundation::E_INVALIDARG,
+                    ));
+                }
+                pin_opt = Some(Zeroizing::new(val.as_bytes().to_vec()));
+                idx += 2;
+            }
+            "--mgmt-key" => {
+                let Some(val) = rest.get(idx + 1) else {
+                    eprintln!("Missing value after --mgmt-key\n");
+                    return Err(windows::core::Error::from_hresult(
+                        windows::Win32::Foundation::E_INVALIDARG,
+                    ));
+                };
+                cur_mgmt = Some(Zeroizing::new(val.clone()));
+                idx += 2;
+            }
+            "--new-mgmt-key" => {
+                let Some(val) = rest.get(idx + 1) else {
+                    eprintln!("Missing value after --new-mgmt-key\n");
+                    return Err(windows::core::Error::from_hresult(
+                        windows::Win32::Foundation::E_INVALIDARG,
+                    ));
+                };
+                new_mgmt = Some(Zeroizing::new(val.clone()));
+                idx += 2;
+            }
+            other => {
+                eprintln!("Unknown --provision-card option: {other}\n");
+                return Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_INVALIDARG,
+                ));
+            }
+        }
+    }
+
+    match provision_card(&CardProvisionOptions {
+        reader: None,
+        pin: pin_opt.as_deref().map(Vec::as_slice),
+        touch_policy_9d,
+        provision_9e,
+        current_mgmt_key_hex: cur_mgmt.as_deref().map(String::as_str),
+        new_mgmt_key_hex: new_mgmt.as_deref().map(String::as_str),
+    }) {
+        Ok(res) => {
+            println!("Successfully provisioned PIV smart card keys:");
+            println!(
+                "  Card:             {}",
+                res.card_name.as_deref().unwrap_or("(unknown)")
+            );
+            println!("  Slot 0x9D SHA256: {}", hex::encode(res.fingerprint_9d));
+            println!(
+                "  Slot 0x9D Policy: ECC P-256, PIN=ALWAYS, Touch={}",
+                format_touch_policy(Some(res.touch_policy_9d))
+            );
+            println!(
+                "  Slot 0x9E Guard:  {}",
+                if res.pub_9e_sec1.is_some() {
+                    "provisioned (ECC P-256, PIN=NEVER, Touch=NEVER)"
+                } else {
+                    "skipped (--no-9e)"
+                }
+            );
+            println!(
+                "  0x9B Mgmt Key:    alg={} ({})",
+                format_mgmt_alg(Some(res.mgmt_alg_used)),
+                if res.mgmt_key_rotated {
+                    "ROTATED — keep your new hex Management Key stored offline!"
+                } else {
+                    "unchanged"
+                }
+            );
+            println!(
+                "\nIMPORTANT: Run 'familiar-enroll.exe' to Set up or Re-bind this account to the newly generated 0x9D key."
+            );
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!("Card provisioning failed: {error}");
+            Err(windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_FAIL,
+            ))
+        }
+    }
+}
+
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // SAFETY: Main Win32 window procedure.
     unsafe {
@@ -459,6 +622,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_COMMAND => {
                 let id = wparam.0 & 0xFFFF;
                 match id {
+                    ID_RADIO_KEEP_KEY | ID_RADIO_TOUCH_ALWAYS | ID_RADIO_TOUCH_NEVER => {
+                        if let Some(st) = state_mut(hwnd) {
+                            st.user_touched_provision_mode = true;
+                        }
+                        sync_provision_controls_enabled(hwnd);
+                    }
                     ID_SETUP_ROTATE => start_setup_with_rotation(hwnd),
                     ID_REBIND_EXISTING => start_rebind_existing_password(hwnd),
                     ID_PROBE => spawn_probe_worker(hwnd, true),
@@ -482,6 +651,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 }
                 LRESULT(0)
             }
+            WM_WORKER_STATUS => {
+                let ptr = lparam.0 as *mut String;
+                if !ptr.is_null() {
+                    let msg_text = *Box::from_raw(ptr);
+                    set_status(hwnd, &msg_text);
+                }
+                LRESULT(0)
+            }
             WM_WORKER_RESULT => {
                 let ptr = lparam.0 as *mut WorkerOutcome;
                 if !ptr.is_null() {
@@ -496,6 +673,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     let st = Box::from_raw(pointer);
                     scrub_edit_control(st.pin);
                     scrub_edit_control(st.password);
+                    scrub_edit_control(st.mgmt_cur);
+                    scrub_edit_control(st.mgmt_new);
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 }
                 PostQuitMessage(0);
@@ -516,9 +695,9 @@ unsafe fn create_controls(hwnd: HWND) {
             w!("STATIC"),
             "Familiar Smartcard — Local Account PIV Setup",
             20,
-            14,
+            12,
             840,
-            24,
+            22,
             0,
         );
         set_font(title, font);
@@ -528,9 +707,9 @@ unsafe fn create_controls(hwnd: HWND) {
             w!("STATIC"),
             "Recommended: generate a 36-char offline recovery password and bind it to your PIV 9D smart card.",
             20,
-            40,
+            36,
             860,
-            22,
+            20,
             0,
         );
         set_font(subtitle, font);
@@ -540,7 +719,7 @@ unsafe fn create_controls(hwnd: HWND) {
             w!("STATIC"),
             "Checking for PIV smart card in background...",
             20,
-            68,
+            60,
             860,
             22,
             0,
@@ -552,13 +731,13 @@ unsafe fn create_controls(hwnd: HWND) {
             w!("STATIC"),
             "PIV PIN (6-8 digits)",
             20,
-            102,
+            92,
             180,
             22,
             0,
         );
         set_font(pin_label, font);
-        let pin = create_control(hwnd, w!("EDIT"), "", 210, 100, 180, 24, 0);
+        let pin = create_control(hwnd, w!("EDIT"), "", 210, 90, 180, 24, 0);
         let _ = SendMessageW(
             pin,
             EM_SETPASSWORDCHAR,
@@ -572,13 +751,13 @@ unsafe fn create_controls(hwnd: HWND) {
             w!("STATIC"),
             "Current Windows password",
             20,
-            136,
+            124,
             180,
             22,
             0,
         );
         set_font(password_label, font);
-        let password = create_control(hwnd, w!("EDIT"), "", 210, 134, 380, 24, 0);
+        let password = create_control(hwnd, w!("EDIT"), "", 210, 122, 380, 24, 0);
         let _ = SendMessageW(
             password,
             EM_SETPASSWORDCHAR,
@@ -587,13 +766,120 @@ unsafe fn create_controls(hwnd: HWND) {
         );
         set_font(password, font);
 
+        // Integrated Card Key & Touch Policy controls (applied during Set up / Re-bind)
+        let prov_label = create_control(
+            hwnd,
+            w!("STATIC"),
+            "Card Key & Touch Policy (applied during Set up / Re-bind):",
+            20,
+            156,
+            860,
+            20,
+            0,
+        );
+        set_font(prov_label, font);
+
+        let radio_keep = create_check_control(
+            hwnd,
+            "Keep existing 0x9D card key",
+            20,
+            178,
+            235,
+            22,
+            STYLE_AUTORADIO | STYLE_GROUP,
+            ID_RADIO_KEEP_KEY as isize,
+            font,
+        );
+        let _ = SendMessageW(
+            radio_keep,
+            BM_SETCHECK,
+            Some(WPARAM(BST_CHECKED)),
+            Some(LPARAM(0)),
+        );
+
+        let radio_touch_always = create_check_control(
+            hwnd,
+            "New 0x9D: Touch = ALWAYS (physical touch)",
+            262,
+            178,
+            318,
+            22,
+            STYLE_AUTORADIO,
+            ID_RADIO_TOUCH_ALWAYS as isize,
+            font,
+        );
+
+        let radio_touch_never = create_check_control(
+            hwnd,
+            "New 0x9D: Touch = NEVER (PIN only)",
+            590,
+            178,
+            290,
+            22,
+            STYLE_AUTORADIO,
+            ID_RADIO_TOUCH_NEVER as isize,
+            font,
+        );
+
+        let chk_9e = create_check_control(
+            hwnd,
+            "Also generate Slot 0x9E anti-phishing key (PIN=NEVER, Touch=NEVER)",
+            20,
+            204,
+            510,
+            22,
+            STYLE_AUTOCHECKBOX | STYLE_GROUP,
+            ID_CHK_PROVISION_9E as isize,
+            font,
+        );
+        let _ = SendMessageW(
+            chk_9e,
+            BM_SETCHECK,
+            Some(WPARAM(BST_CHECKED)),
+            Some(LPARAM(0)),
+        );
+
+        let mgmt_cur_lbl = create_control(
+            hwnd,
+            w!("STATIC"),
+            "0x9B Mgmt Key (blank=default)",
+            20,
+            234,
+            215,
+            22,
+            0,
+        );
+        set_font(mgmt_cur_lbl, font);
+        let mgmt_cur = create_control(hwnd, w!("EDIT"), "", 240, 232, 195, 24, 0);
+        let _ = SendMessageW(
+            mgmt_cur,
+            EM_SETPASSWORDCHAR,
+            Some(WPARAM(PASSWORD_CHAR)),
+            Some(LPARAM(0)),
+        );
+        set_font(mgmt_cur, font);
+
+        let mgmt_new_lbl = create_control(
+            hwnd,
+            w!("STATIC"),
+            "Rotate 0x9B to (opt. hex)",
+            450,
+            234,
+            185,
+            22,
+            0,
+        );
+        set_font(mgmt_new_lbl, font);
+        let mgmt_new = create_control(hwnd, w!("EDIT"), "", 640, 232, 240, 24, 0);
+        set_font(mgmt_new, font);
+
         // Row 1: Primary enrollment vs Advanced/Rescue re-bind
         let btn_setup = create_control(
             hwnd,
             w!("BUTTON"),
             "Set up & rotate password (Recommended)",
             20,
-            174,
+            268,
             290,
             38,
             ID_SETUP_ROTATE as isize,
@@ -605,7 +891,7 @@ unsafe fn create_controls(hwnd: HWND) {
             w!("BUTTON"),
             "Re-bind current password (Advanced / Rescue)",
             322,
-            174,
+            268,
             305,
             38,
             ID_REBIND_EXISTING as isize,
@@ -618,7 +904,7 @@ unsafe fn create_controls(hwnd: HWND) {
             w!("BUTTON"),
             "Probe card",
             20,
-            220,
+            314,
             105,
             30,
             ID_PROBE as isize,
@@ -630,7 +916,7 @@ unsafe fn create_controls(hwnd: HWND) {
             w!("BUTTON"),
             "Self-test vault",
             133,
-            220,
+            314,
             120,
             30,
             ID_SELFTEST as isize,
@@ -642,7 +928,7 @@ unsafe fn create_controls(hwnd: HWND) {
             w!("BUTTON"),
             "Unblock PIN / PUK...",
             261,
-            220,
+            314,
             165,
             30,
             ID_MANAGE_PUK as isize,
@@ -654,7 +940,7 @@ unsafe fn create_controls(hwnd: HWND) {
             w!("BUTTON"),
             "Re-pin card root",
             434,
-            220,
+            314,
             140,
             30,
             ID_REPIN_ROOT as isize,
@@ -666,7 +952,7 @@ unsafe fn create_controls(hwnd: HWND) {
             w!("BUTTON"),
             "Register provider",
             582,
-            220,
+            314,
             145,
             30,
             ID_REGISTER as isize,
@@ -678,7 +964,7 @@ unsafe fn create_controls(hwnd: HWND) {
             w!("BUTTON"),
             "Clear output",
             735,
-            220,
+            314,
             115,
             30,
             ID_CLEAR as isize,
@@ -697,9 +983,9 @@ unsafe fn create_controls(hwnd: HWND) {
             PCWSTR::null(),
             out_style,
             20,
-            262,
+            354,
             860,
-            408,
+            418,
             Some(hwnd),
             None,
             None,
@@ -713,6 +999,12 @@ unsafe fn create_controls(hwnd: HWND) {
             output,
             pin,
             password,
+            radio_keep,
+            radio_touch_always,
+            radio_touch_never,
+            chk_9e,
+            mgmt_cur,
+            mgmt_new,
             buttons: [
                 btn_setup,
                 btn_rebind,
@@ -723,9 +1015,70 @@ unsafe fn create_controls(hwnd: HWND) {
                 btn_register,
                 btn_clear,
             ],
+            user_touched_provision_mode: false,
             busy: false,
         });
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
+        sync_provision_controls_enabled(hwnd);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn create_check_control(
+    parent: HWND,
+    text: &str,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    extra_style: WINDOW_STYLE,
+    id: isize,
+    font: HFONT,
+) -> HWND {
+    let wide = to_wide(text);
+    // SAFETY: Standard Win32 radio/checkbox BUTTON creation without WS_BORDER.
+    unsafe {
+        let ctrl = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("BUTTON"),
+            PCWSTR(wide.as_ptr()),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | extra_style,
+            x,
+            y,
+            width,
+            height,
+            Some(parent),
+            Some(HMENU(id as *mut c_void)),
+            None,
+            None,
+        )
+        .unwrap_or_default();
+        set_font(ctrl, font);
+        ctrl
+    }
+}
+
+unsafe fn is_checked(hwnd: HWND) -> bool {
+    // SAFETY: Queries Win32 button check state.
+    unsafe {
+        SendMessageW(hwnd, BM_GETCHECK, Some(WPARAM(0)), Some(LPARAM(0))).0 == BST_CHECKED as isize
+    }
+}
+
+unsafe fn sync_provision_controls_enabled(hwnd: HWND) {
+    // SAFETY: Enables/disables provisioning options based on radio state and busy flag.
+    unsafe {
+        let Some(st) = state_mut(hwnd) else {
+            return;
+        };
+        let provisioning =
+            !st.busy && (is_checked(st.radio_touch_always) || is_checked(st.radio_touch_never));
+        let _ = EnableWindow(st.radio_keep, !st.busy);
+        let _ = EnableWindow(st.radio_touch_always, !st.busy);
+        let _ = EnableWindow(st.radio_touch_never, !st.busy);
+        let _ = EnableWindow(st.chk_9e, provisioning);
+        let _ = EnableWindow(st.mgmt_cur, provisioning);
+        let _ = EnableWindow(st.mgmt_new, provisioning);
     }
 }
 
@@ -802,6 +1155,7 @@ unsafe fn set_busy(hwnd: HWND, busy: bool, status_text: &str) {
             let wide = to_wide(status_text);
             let _ = SetWindowTextW(st.status, PCWSTR(wide.as_ptr()));
         }
+        sync_provision_controls_enabled(hwnd);
     }
 }
 
@@ -821,6 +1175,24 @@ unsafe fn set_output(hwnd: HWND, text: &str) {
         if let Some(st) = state_mut(hwnd) {
             let wide = to_wide(text);
             let _ = SetWindowTextW(st.output, PCWSTR(wide.as_ptr()));
+        }
+    }
+}
+
+fn post_status(hwnd_raw: isize, status_text: impl Into<String>) {
+    let boxed = Box::into_raw(Box::new(status_text.into()));
+    let hwnd = HWND(hwnd_raw as *mut c_void);
+    // SAFETY: Posts heap-allocated status `String` to main UI thread; freed on receipt.
+    unsafe {
+        if PostMessageW(
+            Some(hwnd),
+            WM_WORKER_STATUS,
+            WPARAM(0),
+            LPARAM(boxed as isize),
+        )
+        .is_err()
+        {
+            drop(Box::from_raw(boxed));
         }
     }
 }
@@ -875,26 +1247,127 @@ unsafe fn spawn_probe_worker(hwnd: HWND, update_output: bool) {
             Ok(readers) if readers.is_empty() => WorkerOutcome::ProbeDone {
                 status: "No PIV smart card detected. Insert your card (or enable Smart Cards in RDP) and click Probe card.".into(),
                 output: update_output.then(|| "No smart card reader found.\r\n".into()),
+                piv_card_without_9d: false,
             },
             Ok(readers) => {
+                let any_piv = readers.iter().any(|r| r.piv_selected);
+                let any_9d_key = readers
+                    .iter()
+                    .flat_map(|r| r.slots.iter())
+                    .any(|s| s.slot == 0x9D && s.has_key);
                 let (ready, policy_err) = compliant_9d_present(&readers);
                 let status = if ready {
-                    "PIV smart card detected. Slot 0x9D key is ready for enrollment.".into()
+                    "PIV smart card detected. Slot 0x9D is ready (or choose New 0x9D below to change Touch policy).".into()
                 } else if let Some(err) = policy_err {
-                    format!("PIV smart card detected, but slot 0x9D failed policy check: {err}")
+                    format!("PIV smart card detected, but slot 0x9D failed policy check: {err} — select New 0x9D below to re-provision.")
+                } else if any_piv {
+                    "New/empty PIV smart card detected — 'New 0x9D: Touch = ALWAYS' selected for one-step provisioning.".into()
                 } else {
-                    "Smart card detected, but PIV slot 0x9D has no key. Provision the card first.".into()
+                    "Smart card reader detected, but no PIV card is present.".into()
                 };
                 let output = update_output.then(|| format_readers(&readers, pinned_f9.as_deref()));
-                WorkerOutcome::ProbeDone { status, output }
+                WorkerOutcome::ProbeDone {
+                    status,
+                    output,
+                    piv_card_without_9d: any_piv && !any_9d_key,
+                }
             }
             Err(error) => WorkerOutcome::ProbeDone {
                 status: format!("Card probe failed: {error}"),
                 output: update_output.then(|| format!("Probe failed: {error}\r\n")),
+                piv_card_without_9d: false,
             },
         };
         post_outcome(hwnd_raw, outcome);
     });
+}
+
+/// Read and validate the integrated Card Key & Touch Policy controls, asking for
+/// explicit confirmation if rotating `0x9B` or overwriting an existing `0x9D` key.
+/// Returns `Ok(None)` when `"Keep existing 0x9D card key"` is selected, `Ok(Some(plan))`
+/// when provisioning is confirmed, or `Err(None)` when the user cancels confirmation.
+unsafe fn read_and_confirm_provision_plan(
+    hwnd: HWND,
+) -> Result<Option<ProvisionPlan>, Option<String>> {
+    let (touch_always, touch_never, provision_9e, current_mgmt_hex, new_mgmt_hex) = unsafe {
+        let Some(st) = state_mut(hwnd) else {
+            return Err(None);
+        };
+        (
+            is_checked(st.radio_touch_always),
+            is_checked(st.radio_touch_never),
+            is_checked(st.chk_9e),
+            read_edit(st.mgmt_cur),
+            read_edit(st.mgmt_new),
+        )
+    };
+
+    if !touch_always && !touch_never {
+        return Ok(None);
+    }
+
+    let touch_policy_9d = if touch_always {
+        TOUCH_POLICY_ALWAYS
+    } else {
+        TOUCH_POLICY_NEVER
+    };
+
+    if !current_mgmt_hex.trim().is_empty() {
+        if let Err(e) = parse_mgmt_key_hex(&current_mgmt_hex) {
+            return Err(Some(e.to_string()));
+        }
+    }
+    if !new_mgmt_hex.trim().is_empty() {
+        if let Err(e) = parse_mgmt_key_hex(&new_mgmt_hex) {
+            return Err(Some(format!("Invalid new 0x9B Management Key: {e}")));
+        }
+        let rot_confirm = unsafe {
+            MessageBoxW(
+                Some(hwnd),
+                w!("You entered a new hex key in 'Rotate 0x9B to'.\r\n\r\n\
+                    Make sure you have saved this 0x9B Management Key offline! Without it, future PIV key generation on this card will require resetting the PIV applet.\r\n\r\n\
+                    Proceed with rotating the card's 0x9B Management Key?"),
+                w!("Confirm 0x9B Management Key Rotation"),
+                MB_YESNO | MB_ICONWARNING,
+            )
+        };
+        if rot_confirm.0 != 6 {
+            return Err(None);
+        }
+    }
+
+    if card_has_9d_key(None) {
+        let policy_name = if touch_policy_9d == TOUCH_POLICY_ALWAYS {
+            "ALWAYS (physical touch required)"
+        } else {
+            "NEVER (PIN only)"
+        };
+        let warn_msg = format!(
+            "Slot 0x9D on the connected smart card ALREADY contains a key.\r\n\r\n\
+             Generating a new 0x9D key with Touch Policy = {policy_name} will permanently overwrite the existing key on this card.\r\n\
+             Any OTHER computers or tools bound to the old key on this card will need re-enrollment.\r\n\r\n\
+             Overwrite the existing card key and continue?"
+        );
+        let warn_w = to_wide(&warn_msg);
+        let overwrite_confirm = unsafe {
+            MessageBoxW(
+                Some(hwnd),
+                PCWSTR(warn_w.as_ptr()),
+                w!("Confirm Overwriting Existing Card Key"),
+                MB_YESNO | MB_ICONWARNING,
+            )
+        };
+        if overwrite_confirm.0 != 6 {
+            return Err(None);
+        }
+    }
+
+    Ok(Some(ProvisionPlan {
+        touch_policy_9d,
+        provision_9e,
+        current_mgmt_hex,
+        new_mgmt_hex,
+    }))
 }
 
 unsafe fn start_setup_with_rotation(hwnd: HWND) {
@@ -922,18 +1395,27 @@ unsafe fn start_setup_with_rotation(hwnd: HWND) {
         return;
     }
 
+    let provision_plan = match unsafe { read_and_confirm_provision_plan(hwnd) } {
+        Ok(plan) => plan,
+        Err(Some(msg)) => {
+            unsafe { set_status(hwnd, &msg) };
+            return;
+        }
+        Err(None) => return,
+    };
+
     unsafe {
         set_busy(
             hwnd,
             true,
-            "Phase 1/2: Validating account, checking 0x9D/0xF9 card policy & running card self-test...",
+            "Phase 1/2: Validating account, checking card policy & running card self-test...",
         );
     }
 
     let hwnd_raw = hwnd.0 as isize;
     std::thread::spawn(move || {
         let res: Result<PreparedRotation, String> = (|| {
-            // Pre-flight check binary package BEFORE touching the account or smart card!
+            // Pre-flight check binary package & Windows password BEFORE touching the smart card!
             installer::preflight_check_sources()?;
 
             let user =
@@ -941,6 +1423,29 @@ unsafe fn start_setup_with_rotation(hwnd: HWND) {
             let _ = verify_local_workgroup_account(&user.username).map_err(|e| e.to_string())?;
             validate_windows_password(&user, &current_password)
                 .map_err(|e| format!("Current Windows password is incorrect: {e}"))?;
+
+            let mut mgmt_rotated = false;
+            if let Some(plan) = &provision_plan {
+                post_status(
+                    hwnd_raw,
+                    format!(
+                        "Phase 1/2: Provisioning on-card ECC P-256 key (Touch = {})...",
+                        format_touch_policy(Some(plan.touch_policy_9d))
+                    ),
+                );
+                let prov_res = provision_card(&CardProvisionOptions {
+                    reader: None,
+                    pin: Some(pin.as_bytes()),
+                    touch_policy_9d: plan.touch_policy_9d,
+                    provision_9e: plan.provision_9e,
+                    current_mgmt_key_hex: Some(plan.current_mgmt_hex.as_str())
+                        .filter(|s| !s.trim().is_empty()),
+                    new_mgmt_key_hex: Some(plan.new_mgmt_hex.as_str())
+                        .filter(|s| !s.trim().is_empty()),
+                })
+                .map_err(|e| format!("Card key provisioning failed: {e}"))?;
+                mgmt_rotated = prov_res.mgmt_key_rotated;
+            }
 
             let new_password = generate_recovery_password();
             let placeholder_ts = password_last_set(&user.username).map_err(|e| e.to_string())?;
@@ -955,6 +1460,13 @@ unsafe fn start_setup_with_rotation(hwnd: HWND) {
                 attestation_policy: AttestationPolicy::EnforceOrPinFirstUse,
             })
             .map_err(|e| format!("Card enrollment failed: {e}"))?;
+
+            if enrolled.touch_policy == TOUCH_POLICY_ALWAYS {
+                post_status(
+                    hwnd_raw,
+                    "ACTION REQUIRED: Touch your blinking security key now (2 touches required for Touch=ALWAYS self-test)...",
+                );
+            }
 
             // Mandatory Phase B card self-test BEFORE touching the real Windows password!
             let mut pin_bytes = Zeroizing::new(pin.as_bytes().to_vec());
@@ -995,6 +1507,7 @@ unsafe fn start_setup_with_rotation(hwnd: HWND) {
                 pin_is_default: enrolled.pin_is_default,
                 puk_is_default: enrolled.puk_is_default,
                 card_auth_9e_pub: enrolled.card_auth_9e_pub,
+                mgmt_rotated,
             })
         })();
 
@@ -1124,6 +1637,7 @@ unsafe fn commit_confirmed_rotation(hwnd: HWND, prepared: PreparedRotation) {
                      SID:            {}\r\n\
                      Card:           {}\r\n\
                      9D Fingerprint: {}\r\n\
+                     9D Touch:       {}\r\n\
                      0xF9 Root:      {}\r\n\
                      Pre-PIN 0x9E:   {}\r\n\
                      Card Self-Test: succeeded\r\n\
@@ -1134,10 +1648,16 @@ unsafe fn commit_confirmed_rotation(hwnd: HWND, prepared: PreparedRotation) {
                     user.sid,
                     prepared.card_name,
                     prepared.fingerprint_hex,
+                    format_touch_policy(Some(prepared.touch_policy)),
                     prepared.f9_status,
                     guard_9e,
                     install_summary
                 );
+                if prepared.mgmt_rotated {
+                    report.push_str(
+                        "\r\n0x9B MGMT KEY ROTATED: Keep your new hex 0x9B Management Key stored safely offline.\r\n",
+                    );
+                }
                 if prepared.pin_is_default || prepared.puk_is_default {
                     report.push_str(
                         "\r\nSECURITY WARNING: Your smart card PIN (123456) and/or PUK (12345678) is still set to the factory default!\r\n\
@@ -1204,6 +1724,15 @@ unsafe fn start_rebind_existing_password(hwnd: HWND) {
         return;
     }
 
+    let provision_plan = match unsafe { read_and_confirm_provision_plan(hwnd) } {
+        Ok(plan) => plan,
+        Err(Some(msg)) => {
+            unsafe { set_status(hwnd, &msg) };
+            return;
+        }
+        Err(None) => return,
+    };
+
     // Explicit security warning per project design.
     let confirm = unsafe {
         MessageBoxW(
@@ -1231,7 +1760,7 @@ unsafe fn start_rebind_existing_password(hwnd: HWND) {
     let hwnd_raw = hwnd.0 as isize;
     std::thread::spawn(move || {
         let res: Result<String, String> = (|| {
-            // Install and register provider binaries BEFORE writing vault!
+            // Install and register provider binaries & validate Windows password BEFORE touching the card!
             let install_summary = installer::install_and_register()?;
 
             let user =
@@ -1242,6 +1771,29 @@ unsafe fn start_rebind_existing_password(hwnd: HWND) {
                 .map_err(|e| format!("Windows password validation failed: {e}"))?;
             let last_set =
                 password_last_set_for_enrollment(&user.username).map_err(|e| e.to_string())?;
+
+            let mut mgmt_rotated = false;
+            if let Some(plan) = &provision_plan {
+                post_status(
+                    hwnd_raw,
+                    format!(
+                        "Provisioning on-card ECC P-256 key (Touch = {})...",
+                        format_touch_policy(Some(plan.touch_policy_9d))
+                    ),
+                );
+                let prov_res = provision_card(&CardProvisionOptions {
+                    reader: None,
+                    pin: Some(pin.as_bytes()),
+                    touch_policy_9d: plan.touch_policy_9d,
+                    provision_9e: plan.provision_9e,
+                    current_mgmt_key_hex: Some(plan.current_mgmt_hex.as_str())
+                        .filter(|s| !s.trim().is_empty()),
+                    new_mgmt_key_hex: Some(plan.new_mgmt_hex.as_str())
+                        .filter(|s| !s.trim().is_empty()),
+                })
+                .map_err(|e| format!("Card key provisioning failed: {e}"))?;
+                mgmt_rotated = prov_res.mgmt_key_rotated;
+            }
 
             let enrolled = enroll_with_options(&EnrollOptions {
                 reader: None,
@@ -1267,6 +1819,13 @@ unsafe fn start_rebind_existing_password(hwnd: HWND) {
                 let _ = clear_card_auth_9e_pub(&user.sid);
             }
 
+            if enrolled.touch_policy == TOUCH_POLICY_ALWAYS {
+                post_status(
+                    hwnd_raw,
+                    "ACTION REQUIRED: Touch your blinking security key now (2 touches required for Touch=ALWAYS self-test)...",
+                );
+            }
+
             self_test_internal(&pin, &password, &user)?;
             let _ = purge_vault_backup(&user.sid);
 
@@ -1287,6 +1846,7 @@ unsafe fn start_rebind_existing_password(hwnd: HWND) {
                  SID:            {}\r\n\
                  Card:           {}\r\n\
                  9D Fingerprint: {}\r\n\
+                 9D Touch:       {}\r\n\
                  0xF9 Root:      {}\r\n\
                  Pre-PIN 0x9E:   {}\r\n\
                  Self-Test:      succeeded\r\n\
@@ -1296,10 +1856,16 @@ unsafe fn start_rebind_existing_password(hwnd: HWND) {
                 user.sid,
                 enrolled.card_name.as_deref().unwrap_or("(unknown)"),
                 hex::encode(enrolled.card_pub_fingerprint),
+                format_touch_policy(Some(enrolled.touch_policy)),
                 f9_status,
                 guard_9e,
                 install_summary
             );
+            if mgmt_rotated {
+                msg.push_str(
+                    "\r\n0x9B MGMT KEY ROTATED: Keep your new hex 0x9B Management Key stored safely offline.\r\n",
+                );
+            }
             if safety.lockout_threshold == 0 {
                 msg.push_str(
                     "\r\nSECURITY NOTE: Account Lockout Threshold is 0 while keeping an existing password.\r\n\
@@ -1491,7 +2057,35 @@ unsafe fn handle_worker_outcome(hwnd: HWND, outcome: WorkerOutcome) {
     // SAFETY: Invoked on main UI thread from `WM_WORKER_RESULT`.
     unsafe {
         match outcome {
-            WorkerOutcome::ProbeDone { status, output } => {
+            WorkerOutcome::ProbeDone {
+                status,
+                output,
+                piv_card_without_9d,
+            } => {
+                if piv_card_without_9d {
+                    if let Some(st) = state_mut(hwnd) {
+                        if !st.user_touched_provision_mode {
+                            let _ = SendMessageW(
+                                st.radio_keep,
+                                BM_SETCHECK,
+                                Some(WPARAM(BST_UNCHECKED)),
+                                Some(LPARAM(0)),
+                            );
+                            let _ = SendMessageW(
+                                st.radio_touch_never,
+                                BM_SETCHECK,
+                                Some(WPARAM(BST_UNCHECKED)),
+                                Some(LPARAM(0)),
+                            );
+                            let _ = SendMessageW(
+                                st.radio_touch_always,
+                                BM_SETCHECK,
+                                Some(WPARAM(BST_CHECKED)),
+                                Some(LPARAM(0)),
+                            );
+                        }
+                    }
+                }
                 set_busy(hwnd, false, &status);
                 if let Some(text) = output {
                     set_output(hwnd, &text);
@@ -1503,15 +2097,37 @@ unsafe fn handle_worker_outcome(hwnd: HWND, outcome: WorkerOutcome) {
                 clear_secrets,
                 critical_modal_error,
             } => {
-                set_busy(hwnd, false, &status);
-                if let Some(text) = output {
-                    set_output(hwnd, &text);
-                }
                 if clear_secrets {
+                    // After successful enrollment, switch radio back to Keep existing key
+                    // so subsequent actions do not re-overwrite the newly enrolled key.
                     if let Some(st) = state_mut(hwnd) {
                         scrub_edit_control(st.pin);
                         scrub_edit_control(st.password);
+                        scrub_edit_control(st.mgmt_cur);
+                        scrub_edit_control(st.mgmt_new);
+                        let _ = SendMessageW(
+                            st.radio_touch_always,
+                            BM_SETCHECK,
+                            Some(WPARAM(BST_UNCHECKED)),
+                            Some(LPARAM(0)),
+                        );
+                        let _ = SendMessageW(
+                            st.radio_touch_never,
+                            BM_SETCHECK,
+                            Some(WPARAM(BST_UNCHECKED)),
+                            Some(LPARAM(0)),
+                        );
+                        let _ = SendMessageW(
+                            st.radio_keep,
+                            BM_SETCHECK,
+                            Some(WPARAM(BST_CHECKED)),
+                            Some(LPARAM(0)),
+                        );
                     }
+                }
+                set_busy(hwnd, false, &status);
+                if let Some(text) = output {
+                    set_output(hwnd, &text);
                 }
                 if let Some(alert) = critical_modal_error {
                     let alert_w = to_wide(&alert);
@@ -1689,6 +2305,32 @@ fn format_origin(v: Option<u8>) -> &'static str {
     }
 }
 
+fn format_mgmt_alg(v: Option<u8>) -> &'static str {
+    match v {
+        Some(ALG_3DES) => "3DES (24B)",
+        Some(ALG_AES_128) => "AES-128 (16B)",
+        Some(ALG_AES_192) => "AES-192 (24B)",
+        Some(ALG_AES_256) => "AES-256 (32B)",
+        Some(_) => "unknown",
+        None => "n/a",
+    }
+}
+
+fn format_mgmt_line(meta: &Option<MgmtKeyMetadata>) -> String {
+    let Some(m) = meta else {
+        return "  Mgmt Key (0x9B): metadata not reported\r\n".into();
+    };
+    let def_note = match m.is_default {
+        Some(true) => " [FACTORY DEFAULT 010203...08 — rotation optional]",
+        Some(false) => " [custom / PIN-protected]",
+        None => "",
+    };
+    format!(
+        "  Mgmt Key (0x9B): alg={}{def_note}\r\n",
+        format_mgmt_alg(m.algorithm)
+    )
+}
+
 fn format_pin_puk_line(label: &str, default_val: &str, meta: &Option<PinPukMetadata>) -> String {
     let Some(m) = meta else {
         return format!("  {label}: not reported\r\n");
@@ -1740,6 +2382,7 @@ fn format_readers(readers: &[scard_core::ReaderProbe], pinned_f9: Option<&str>) 
                 "12345678",
                 &reader.puk_metadata,
             ));
+            out.push_str(&format_mgmt_line(&reader.mgmt_metadata));
             match (&reader.f9_fingerprint_hex, reader.attestation_verified) {
                 (Some(f9_hex), true) => {
                     let pin_match = match pinned_f9 {

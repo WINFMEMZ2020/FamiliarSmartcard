@@ -15,14 +15,25 @@ pub const PIV_AID: [u8; 11] = [
 
 pub const SLOT_KEY_MANAGEMENT: u8 = 0x9D;
 pub const SLOT_PIV_AUTH: u8 = 0x9A;
+pub const SLOT_CARD_MANAGEMENT: u8 = 0x9B;
 pub const SLOT_DIGITAL_SIGNATURE: u8 = 0x9C;
 pub const SLOT_CARD_AUTH: u8 = 0x9E;
 pub const SLOT_ATTESTATION: u8 = 0xF9;
 pub const KEY_REF_PIN: u8 = 0x80;
 pub const KEY_REF_PUK: u8 = 0x81;
 
+pub const ALG_3DES: u8 = 0x03;
+pub const ALG_AES_128: u8 = 0x08;
+pub const ALG_AES_192: u8 = 0x0A;
+pub const ALG_AES_256: u8 = 0x0C;
 pub const ALG_ECC_P256: u8 = 0x11;
 pub const ALG_ECC_P384: u8 = 0x14;
+
+/// Standard NIST SP 800-73-4 / PIV 24-byte factory default Management Key (`0x9B`).
+pub const DEFAULT_MGMT_KEY: [u8; 24] = [
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+];
 
 pub const PIN_POLICY_NEVER: u8 = 0x01;
 pub const PIN_POLICY_ONCE: u8 = 0x02;
@@ -36,6 +47,7 @@ pub const ORIGIN_GENERATED: u8 = 0x01;
 pub const ORIGIN_IMPORTED: u8 = 0x02;
 
 pub const OID_CERT_PIV_AUTH: [u8; 3] = [0x5F, 0xC1, 0x05];
+pub const OID_PRINTED_INFO: [u8; 3] = [0x5F, 0xC1, 0x09];
 pub const OID_CERT_DIGITAL_SIGNATURE: [u8; 3] = [0x5F, 0xC1, 0x0A];
 pub const OID_CERT_KEY_MANAGEMENT: [u8; 3] = [0x5F, 0xC1, 0x0B];
 pub const OID_CERT_CARD_AUTH: [u8; 3] = [0x5F, 0xC1, 0x01];
@@ -110,7 +122,32 @@ pub struct PinPukMetadata {
     pub remaining_retries: Option<u8>,
 }
 
+/// Read-only PIV Management Key (`0x9B`) status from `GET METADATA` (`00 F7 00 9B`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MgmtKeyMetadata {
+    pub algorithm: Option<u8>,
+    pub is_default: Option<bool>,
+    pub touch_policy: Option<u8>,
+}
+
 impl SlotMetadata {
+    pub fn parse_mgmt_key(&self) -> MgmtKeyMetadata {
+        let algorithm = find_tlv(&self.raw, 0x01).and_then(|v| v.first().copied());
+        let touch_policy = find_tlv(&self.raw, 0x02).and_then(|v| {
+            if v.len() >= 2 {
+                Some(v[1])
+            } else {
+                v.first().copied()
+            }
+        });
+        let is_default = find_tlv(&self.raw, 0x05).and_then(|v| v.first().map(|&b| b != 0));
+        MgmtKeyMetadata {
+            algorithm,
+            is_default,
+            touch_policy,
+        }
+    }
+
     pub fn parse_pin_puk(&self) -> PinPukMetadata {
         let is_default = find_tlv(&self.raw, 0x05).and_then(|v| v.first().map(|&b| b != 0));
         let (total_retries, remaining_retries) = match find_tlv(&self.raw, 0x06) {
@@ -556,6 +593,310 @@ impl<'a, T: ApduTransport + ?Sized> PivSession<'a, T> {
         })?;
         Ok(secret.to_vec())
     }
+
+    /// Query read-only PIV Management Key (`0x9B`) metadata via `00 F7 00 9B` when supported.
+    pub fn get_mgmt_key_metadata(&self) -> Result<Option<MgmtKeyMetadata>> {
+        Ok(self
+            .get_metadata(SLOT_CARD_MANAGEMENT)?
+            .map(|m| m.parse_mgmt_key()))
+    }
+
+    /// Authenticate to PIV Slot `0x9B` (`Card Management Key`) using NIST SP 800-73-4
+    /// Mutual Authentication (`7C { 80 <witness> 81 <challenge> }` -> `82 <response>`),
+    /// with automatic fallback to Single Authentication (`81`/`82`) on pure-NIST cards
+    /// that return `SW=6A80` for witness tag `0x80`.
+    pub fn authenticate_mgmt_key_with_alg(&self, alg: u8, key: &[u8]) -> Result<()> {
+        let block_len = crate::mgmt_cipher::mgmt_block_len(alg)?;
+        let expected_key_len = crate::mgmt_cipher::mgmt_key_len(alg)?;
+        if key.len() != expected_key_len {
+            return Err(AuthError::CardPolicy(format!(
+                "0x9B Management Key length ({} bytes) does not match card algorithm 0x{alg:02X} (expected {expected_key_len} bytes)",
+                key.len()
+            )));
+        }
+
+        let step1_mutual = [
+            0x00,
+            0x87,
+            alg,
+            SLOT_CARD_MANAGEMENT,
+            0x04,
+            0x7C,
+            0x02,
+            0x80,
+            0x00,
+        ];
+        let r1 = self.transmit(&step1_mutual)?;
+        if r1.is_success() {
+            let outer1 = find_tlv(&r1.data, 0x7C).ok_or_else(|| {
+                AuthError::Internal("0x9B mutual auth step 1 missing 7C template".into())
+            })?;
+            let enc_witness = find_tlv(outer1, 0x80).ok_or_else(|| {
+                AuthError::Internal("0x9B mutual auth step 1 missing 80 witness".into())
+            })?;
+            if enc_witness.len() != block_len {
+                return Err(AuthError::Internal(
+                    "0x9B witness block size mismatch".into(),
+                ));
+            }
+
+            let dec_witness = crate::mgmt_cipher::mgmt_ecb_decrypt(alg, key, enc_witness)?;
+            let mut host_challenge = Zeroizing::new(vec![0u8; block_len]);
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, host_challenge.as_mut());
+
+            let t80 = Zeroizing::new(tlv(0x80, &dec_witness)?);
+            let t81 = Zeroizing::new(tlv(0x81, &host_challenge)?);
+            let mut inner2 = Zeroizing::new(Vec::with_capacity(t80.len() + t81.len()));
+            inner2.extend_from_slice(&t80);
+            inner2.extend_from_slice(&t81);
+            let outer2 = Zeroizing::new(tlv(0x7C, &inner2)?);
+
+            let lc = u8::try_from(outer2.len())
+                .map_err(|_| AuthError::Unsupported("0x9B auth payload too long"))?;
+            let mut step2 = Zeroizing::new(Vec::with_capacity(5 + outer2.len()));
+            step2.extend_from_slice(&[0x00, 0x87, alg, SLOT_CARD_MANAGEMENT, lc]);
+            step2.extend_from_slice(&outer2);
+
+            let r2 = self.transmit(&step2)?;
+            match (r2.sw1, r2.sw2) {
+                (0x90, 0x00) => {}
+                (0x69, 0x82) | (0x63, _) => {
+                    return Err(AuthError::CardPolicy(
+                        "PIV Management Key (0x9B) authentication failed: incorrect Management Key"
+                            .into(),
+                    ));
+                }
+                _ => {
+                    return Err(AuthError::Apdu {
+                        sw1: r2.sw1,
+                        sw2: r2.sw2,
+                    });
+                }
+            }
+
+            let outer_resp = find_tlv(&r2.data, 0x7C).ok_or_else(|| {
+                AuthError::Internal("0x9B mutual auth step 2 missing 7C template".into())
+            })?;
+            let card_resp = find_tlv(outer_resp, 0x82).ok_or_else(|| {
+                AuthError::Internal("0x9B mutual auth step 2 missing 82 response".into())
+            })?;
+            let expected_resp = crate::mgmt_cipher::mgmt_ecb_encrypt(alg, key, &host_challenge)?;
+            if !crate::crypto::constant_time_eq(card_resp, &expected_resp) {
+                return Err(AuthError::CardPolicy(
+                    "PIV Management Key (0x9B) mutual authentication failed: card response mismatch"
+                        .into(),
+                ));
+            }
+            return Ok(());
+        }
+
+        // Single-authentication fallback for strict NIST SP 800-73-4 cards without 0x80 witness.
+        if (r1.sw1, r1.sw2) == (0x6A, 0x80) {
+            let step1_single = [
+                0x00,
+                0x87,
+                alg,
+                SLOT_CARD_MANAGEMENT,
+                0x04,
+                0x7C,
+                0x02,
+                0x81,
+                0x00,
+            ];
+            let s1 = self.transmit(&step1_single)?;
+            if !s1.is_success() {
+                return Err(AuthError::Apdu {
+                    sw1: s1.sw1,
+                    sw2: s1.sw2,
+                });
+            }
+            let outer1 = find_tlv(&s1.data, 0x7C).ok_or_else(|| {
+                AuthError::Internal("0x9B single auth step 1 missing 7C template".into())
+            })?;
+            let challenge = find_tlv(outer1, 0x81).ok_or_else(|| {
+                AuthError::Internal("0x9B single auth step 1 missing 81 challenge".into())
+            })?;
+            if challenge.len() != block_len {
+                return Err(AuthError::Internal(
+                    "0x9B challenge block size mismatch".into(),
+                ));
+            }
+            let resp_block = crate::mgmt_cipher::mgmt_ecb_encrypt(alg, key, challenge)?;
+            let t82 = Zeroizing::new(tlv(0x82, &resp_block)?);
+            let outer2 = Zeroizing::new(tlv(0x7C, &t82)?);
+            let lc = u8::try_from(outer2.len())
+                .map_err(|_| AuthError::Unsupported("0x9B single auth payload too long"))?;
+            let mut step2 = Zeroizing::new(Vec::with_capacity(5 + outer2.len()));
+            step2.extend_from_slice(&[0x00, 0x87, alg, SLOT_CARD_MANAGEMENT, lc]);
+            step2.extend_from_slice(&outer2);
+            let s2 = self.transmit(&step2)?;
+            return match (s2.sw1, s2.sw2) {
+                (0x90, 0x00) => Ok(()),
+                (0x69, 0x82) | (0x63, _) => Err(AuthError::CardPolicy(
+                    "PIV Management Key (0x9B) authentication failed: incorrect Management Key"
+                        .into(),
+                )),
+                _ => Err(AuthError::Apdu {
+                    sw1: s2.sw1,
+                    sw2: s2.sw2,
+                }),
+            };
+        }
+
+        Err(AuthError::Apdu {
+            sw1: r1.sw1,
+            sw2: r1.sw2,
+        })
+    }
+
+    /// Update PIV Slot `0x9B` Management Key via `SET MANAGEMENT KEY` (`00 FF FF <FE|FF>`).
+    /// Requires an authenticated `0x9B` session in the same PC/SC transaction.
+    pub fn set_management_key(&self, alg: u8, new_key: &[u8], require_touch: bool) -> Result<()> {
+        let expected_len = crate::mgmt_cipher::mgmt_key_len(alg)?;
+        if new_key.len() != expected_len {
+            return Err(AuthError::CardPolicy(format!(
+                "new 0x9B Management Key length ({} bytes) is invalid for algorithm 0x{alg:02X}",
+                new_key.len()
+            )));
+        }
+        let p2 = if require_touch { 0xFE } else { 0xFF };
+        let lc = u8::try_from(3 + new_key.len())
+            .map_err(|_| AuthError::Unsupported("management key too long"))?;
+        let mut apdu = Zeroizing::new(Vec::with_capacity(5 + 3 + new_key.len()));
+        apdu.extend_from_slice(&[
+            0x00,
+            0xFF,
+            0xFF,
+            p2,
+            lc,
+            alg,
+            SLOT_CARD_MANAGEMENT,
+            new_key.len() as u8,
+        ]);
+        apdu.extend_from_slice(new_key);
+
+        let resp = self.transmit(&apdu)?;
+        match (resp.sw1, resp.sw2) {
+            (0x90, 0x00) => Ok(()),
+            (0x69, 0x82) => Err(AuthError::CardPolicy(
+                "cannot update 0x9B Management Key: management session not authenticated".into(),
+            )),
+            (0x6D, 0x00) | (0x6A, 0x81) => Err(AuthError::CardPolicy(
+                "connected smart card does not support the 0xFF SET MANAGEMENT KEY extension"
+                    .into(),
+            )),
+            _ => Err(AuthError::Apdu {
+                sw1: resp.sw1,
+                sw2: resp.sw2,
+            }),
+        }
+    }
+
+    /// Write a PIV data object via `PUT DATA` (`00 DB 3F FF`), using ISO 7816-4
+    /// command chaining (`CLA = 0x10`) when the encoded payload exceeds 240 bytes.
+    pub fn put_data(&self, object_tag: &[u8], inner_53: &[u8]) -> Result<()> {
+        let tag_field = tlv_ber(0x5C, object_tag)?;
+        let data_field = Zeroizing::new(tlv_ber(0x53, inner_53)?);
+        let mut full = Zeroizing::new(Vec::with_capacity(tag_field.len() + data_field.len()));
+        full.extend_from_slice(&tag_field);
+        full.extend_from_slice(&data_field);
+
+        const MAX_CHUNK: usize = 240;
+        let chunks: Vec<&[u8]> = full.chunks(MAX_CHUNK).collect();
+        for (idx, chunk) in chunks.iter().enumerate() {
+            let is_last = idx + 1 == chunks.len();
+            let cla = if is_last { 0x00 } else { 0x10 };
+            let mut frame = Zeroizing::new(Vec::with_capacity(5 + chunk.len()));
+            frame.extend_from_slice(&[cla, 0xDB, 0x3F, 0xFF, chunk.len() as u8]);
+            frame.extend_from_slice(chunk);
+            let resp = self.transmit(&frame)?;
+            if !resp.is_success() {
+                return Err(AuthError::Apdu {
+                    sw1: resp.sw1,
+                    sw2: resp.sw2,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Generate an on-card ECC P-256 key pair in `slot` (`00 47 00 <slot>`) with explicit
+    /// `pin_policy` (`0xAA`) and `touch_policy` (`0xAB`), returning the 65-byte SEC1 public key.
+    ///
+    /// Security rule: if `touch_policy` requires physical touch (`ALWAYS` or `CACHED`) and
+    /// the card firmware rejects `0xAB` (`SW=6A80`/`6A84`), this function FAILS CLOSED and
+    /// never silently downgrades to `Touch = NEVER`.
+    pub fn generate_p256_key(&self, slot: u8, pin_policy: u8, touch_policy: u8) -> Result<Vec<u8>> {
+        if !matches!(
+            touch_policy,
+            TOUCH_POLICY_NEVER | TOUCH_POLICY_ALWAYS | TOUCH_POLICY_CACHED
+        ) {
+            return Err(AuthError::CardPolicy(format!(
+                "unsupported touch policy 0x{touch_policy:02X}"
+            )));
+        }
+
+        let apdu_ext = [
+            0x00,
+            0x47,
+            0x00,
+            slot,
+            0x0B,
+            0xAC,
+            0x09,
+            0x80,
+            0x01,
+            ALG_ECC_P256,
+            0xAA,
+            0x01,
+            pin_policy,
+            0xAB,
+            0x01,
+            touch_policy,
+        ];
+        let mut resp = self.transmit(&apdu_ext)?;
+
+        if matches!((resp.sw1, resp.sw2), (0x6A, 0x80) | (0x6A, 0x84)) {
+            if touch_policy != TOUCH_POLICY_NEVER {
+                return Err(AuthError::CardPolicy(
+                    "connected smart card does not support hardware Touch Policy = ALWAYS (PIV extension 0xAB rejected); select Touch Policy = NEVER for non-touch PIV cards"
+                        .into(),
+                ));
+            }
+            // Pure NIST SP 800-73-4 fallback when Touch=NEVER is requested on cards without 0xAA/0xAB:
+            // allowed for 0x9E (natively PIN=NEVER) or pure-NIST 0x9D cards without 00 F7 metadata.
+            if slot == SLOT_CARD_AUTH || self.get_metadata(SLOT_KEY_MANAGEMENT)?.is_none() {
+                let apdu_std = [
+                    0x00,
+                    0x47,
+                    0x00,
+                    slot,
+                    0x05,
+                    0xAC,
+                    0x03,
+                    0x80,
+                    0x01,
+                    ALG_ECC_P256,
+                ];
+                resp = self.transmit(&apdu_std)?;
+            }
+        }
+
+        if !resp.is_success() {
+            return Err(AuthError::Apdu {
+                sw1: resp.sw1,
+                sw2: resp.sw2,
+            });
+        }
+
+        let point = find_tlv_recursive(&resp.data, 0x86, 0).ok_or_else(|| {
+            AuthError::Internal(
+                "GENERATE ASYMMETRIC KEY PAIR response missing 0x86 EC point".into(),
+            )
+        })?;
+        let _ = crate::crypto::p256_public_from_sec1(point)?;
+        Ok(point.to_vec())
+    }
 }
 
 /// Validate and pad a 6-8 ASCII digit PIV PIN to 8 bytes with `0xFF`.
@@ -618,6 +959,34 @@ pub(crate) fn tlv(tag: u8, value: &[u8]) -> Result<Vec<u8>> {
         Ok(out)
     } else {
         Err(AuthError::Unsupported("TLV value exceeds 255 bytes"))
+    }
+}
+
+/// Encode a BER-TLV up to 8192 bytes (supports 1-byte, `0x81`, and `0x82` lengths).
+pub(crate) fn tlv_ber(tag: u8, value: &[u8]) -> Result<Vec<u8>> {
+    if value.len() <= 127 {
+        let mut out = Vec::with_capacity(2 + value.len());
+        out.push(tag);
+        out.push(value.len() as u8);
+        out.extend_from_slice(value);
+        Ok(out)
+    } else if value.len() <= 255 {
+        let mut out = Vec::with_capacity(3 + value.len());
+        out.push(tag);
+        out.push(0x81);
+        out.push(value.len() as u8);
+        out.extend_from_slice(value);
+        Ok(out)
+    } else if value.len() <= 8192 {
+        let mut out = Vec::with_capacity(4 + value.len());
+        out.push(tag);
+        out.push(0x82);
+        out.push(((value.len() >> 8) & 0xFF) as u8);
+        out.push((value.len() & 0xFF) as u8);
+        out.extend_from_slice(value);
+        Ok(out)
+    } else {
+        Err(AuthError::Unsupported("BER-TLV value exceeds 8192 bytes"))
     }
 }
 

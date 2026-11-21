@@ -42,7 +42,9 @@ windows = { version = "0.62", features = [
 ] }
 zeroize = { version = "1.8", features = ["derive"] }
 aes-gcm = "0.10"
-p256 = { version = "0.13", features = ["ecdh"] }
+aes = "0.8"
+cipher = "0.4"
+p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
 hkdf = "0.12"
 sha2 = "0.10"
 subtle = "2.6"

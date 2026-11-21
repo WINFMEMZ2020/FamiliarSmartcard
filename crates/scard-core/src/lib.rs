@@ -10,9 +10,11 @@ pub mod dpapi;
 pub mod enroll;
 pub mod error;
 pub mod ipc;
+pub mod mgmt_cipher;
 pub mod pcsc;
 pub mod piv;
 pub mod probe;
+pub mod provision;
 pub mod storage;
 pub mod typestate;
 pub mod vault;
@@ -24,8 +26,11 @@ pub use enroll::{
     EnrollResult,
 };
 pub use error::{AuthError, Result};
-pub use piv::PinPukMetadata;
+pub use piv::{MgmtKeyMetadata, PinPukMetadata};
 pub use probe::{ensure_piv_card_present_in_session, probe_readers, ReaderProbe, SlotProbe};
+pub use provision::{
+    card_has_9d_key, parse_mgmt_key_hex, provision_card, CardProvisionOptions, CardProvisionResult,
+};
 pub use typestate::{
     unlock, unlock_with_transport, AuthPipeline, CardConnected, CredentialDecrypted,
     FreshnessProven, KeyUnwrapped, PinVerified, PinVerifiedForUnwrap, VaultLoaded,

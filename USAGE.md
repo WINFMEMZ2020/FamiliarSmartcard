@@ -40,18 +40,18 @@ rescue_delete_cp.reg         # WinRE / 安全模式救援注册表文件
      ```powershell
      net accounts /lockoutthreshold:5 /lockoutduration:10 /lockoutwindow:10
      ```
-4. **验证读卡器、PIN/PUK 状态与卡片策略**：
+4. **验证读卡器、PIN/PUK 状态与卡片策略（无需额外安装 `ykman`）**：
    ```powershell
    .\familiar-enroll.exe --probe
    ```
-   确认输出中 `0x9D` 槽位已就绪（例如支持元数据扩展的卡片显示 `Slot 0x9D: key present [alg=0x11, pin=ALWAYS, touch=NEVER, origin=On-card]`）。
+   若是一把尚未初始化的新卡，`familiar-enroll.exe` 图形界面会在启动时自动选中生钥选项，让你直接在绑卡流程中自定义 `Touch = ALWAYS` 或 `Touch = NEVER` 并一键生成 `0x9D` + `0x9E` 密钥（也可通过命令行 `.\familiar-enroll.exe --provision-card always --pin <PIN>` 独立写入）。
 
 ---
 
-## 2. 推荐做法：使用主入口完成安全绑定与随机密码轮换
+## 2. 推荐做法：使用主入口完成卡片 Touch 策略配置、安全绑定与随机密码轮换
 
 > **推荐主入口**：**`Set up & rotate password (Recommended)`**  
-> 这是生产环境与正式远程主机的标准做法。程序会自动生成 **36 位高熵无歧义随机密码**（9 组 `XXXX-XXXX-...`，约 180 bits 熵，剔除了易混淆的 `0/O/1/I/l`），彻底消除人工弱口令被远程猜解的风险，同时保证**未完成真卡自检与恢复单确认前绝不修改系统密码**。
+> 这是生产环境与正式远程主机的标准做法。程序支持在绑定过程中**直接写入自定义硬件 Touch 策略（`ALWAYS` / `NEVER`）与 `0x9E` 防钓鱼密钥**，并自动生成 **36 位高熵无歧义随机密码**（9 组 `XXXX-XXXX-...`，约 180 bits 熵，剔除了易混淆的 `0/O/1/I/l`），彻底消除人工弱口令被远程猜解的风险，同时保证**未完成真卡自检与恢复单确认前绝不修改系统密码**。
 
 ### 完整操作步骤
 
@@ -59,6 +59,12 @@ rescue_delete_cp.reg         # WinRE / 安全模式救援注册表文件
 2. 在主窗口填写：
    - **`PIV PIN (6-8 digits)`**：输入当前智能卡的 PIV PIN。
    - **`Current Windows password`**：输入目标本地账户**当前的** Windows 密码。
+   - **`Card Key & Touch Policy`（卡片密钥与触摸策略）**：
+     - **`Keep existing 0x9D card key`**：保持卡内现有 `0x9D` 密钥不变（当卡内已有密钥时默认选中，防止误覆盖多机共用的卡片）。
+     - **`New 0x9D: Touch = ALWAYS (physical touch)`**：在卡内重新生成 `0x9D` 密钥并要求每次登录**输入 PIN + 手指物理触碰金属触点**（全新空卡时默认自动选中；安全性最高，防后台恶意进程或远程静默调用）。
+     - **`New 0x9D: Touch = NEVER (PIN only)`**：在卡内重新生成 `0x9D` 密钥且**仅要求输入 PIN 免触摸**（适合钥匙插在够不到的机箱后置接口，或不带电容触摸传感器的传统智能卡）。
+     - **`Also generate Slot 0x9E anti-phishing key (PIN=NEVER)`**（生钥时默认勾选）：一并在 `0x9E` 槽位生成硬件防钓鱼密钥，使每次输 PIN / PUK 前自动执行芯片级动态挑战。
+     - **`0x9B Mgmt Key` / `Rotate 0x9B to`**：若卡片管理密钥仍为出厂默认（`010203...08`）或使用 PIN 保护的管理密钥，留空即可；若需使用或轮换为自定义 32/48/64 位十六进制管理密钥，可直接填入对应输入框（轮换后的新管理密钥请务必离线妥善保存）。
 3. 点击主按钮 **`Set up & rotate password (Recommended)`**：
    - **第 1 阶段（零风险预检与真卡自检）**：程序自动检验内置安装包完整性、识别当前交互式会话用户、验证当前密码、校验卡片 `0x9D` 槽位策略及可选的 `0xF9` 证明链（首次绑定自动固定根指纹），随后用候选 36 位随机密码在真卡上跑完一次完整的两轮 PIN + 双重 ECDH 解密自检。*若此阶段任何一步失败，系统原密码毫发无损。*
 4. **第 2 阶段（离线恢复单抄写/打印与末 6 位核验）**：

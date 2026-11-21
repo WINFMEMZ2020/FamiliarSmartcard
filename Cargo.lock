@@ -428,7 +428,9 @@ dependencies = [
 name = "scard-core"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "aes-gcm",
+ "cipher",
  "hex",
  "hkdf",
  "p256",
