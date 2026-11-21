@@ -4,7 +4,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use scard_core::ipc::{
-    read_framed, write_framed, HelperIcon, HelperRequest, HelperResponse, MAX_IPC_FRAME_LEN,
+    read_framed, write_framed, HelperFailureReason, HelperIcon, HelperRequest, HelperResponse,
+    MAX_IPC_FRAME_LEN,
 };
 use std::io::Cursor;
 use std::mem::size_of;
@@ -106,15 +107,23 @@ pub fn locate_sibling_helper_exe() -> Result<PathBuf, String> {
     Ok(dir.join(HELPER_EXE_NAME))
 }
 
+fn generic_failure(icon: HelperIcon, message: impl Into<String>) -> HelperResponse {
+    HelperResponse::Failure {
+        reason: HelperFailureReason::Generic,
+        icon,
+        message: message.into(),
+    }
+}
+
 /// Spawn `familiar-auth-helper.exe` next to the DLL and run a single unlock request.
 pub fn invoke_auth_helper(req: &HelperRequest, timeout_ms: u32) -> HelperResponse {
     let helper_path = match locate_sibling_helper_exe() {
         Ok(path) => path,
         Err(_) => {
-            return HelperResponse::Failure {
-                icon: HelperIcon::Error,
-                message: "Authentication helper path could not be resolved.".into(),
-            };
+            return generic_failure(
+                HelperIcon::Error,
+                "Authentication helper path could not be resolved.",
+            );
         }
     };
     invoke_auth_helper_at(&helper_path, &[], req, timeout_ms)
@@ -128,20 +137,19 @@ pub fn invoke_auth_helper_at(
     timeout_ms: u32,
 ) -> HelperResponse {
     if !helper_exe.exists() {
-        return HelperResponse::Failure {
-            icon: HelperIcon::Error,
-            message: "Authentication helper executable is missing. Re-run FamiliarSmartcard setup."
-                .into(),
-        };
+        return generic_failure(
+            HelperIcon::Error,
+            "Authentication helper executable is missing. Re-run FamiliarSmartcard setup.",
+        );
     }
 
     let encoded_req = match req.encode() {
         Ok(bytes) => bytes,
         Err(_) => {
-            return HelperResponse::Failure {
-                icon: HelperIcon::Error,
-                message: "Failed to encode authentication request.".into(),
-            };
+            return generic_failure(
+                HelperIcon::Error,
+                "Failed to encode authentication request.",
+            );
         }
     };
 
@@ -155,10 +163,7 @@ pub fn invoke_auth_helper_at(
     let mut stdin_write_raw = HANDLE::default();
     // SAFETY: Creates anonymous pipe with `4096`-byte kernel buffer (> `MAX_IPC_FRAME_LEN`).
     if unsafe { CreatePipe(&mut stdin_read_raw, &mut stdin_write_raw, Some(&sa), 4096) }.is_err() {
-        return HelperResponse::Failure {
-            icon: HelperIcon::Error,
-            message: "Failed to create helper input pipe.".into(),
-        };
+        return generic_failure(HelperIcon::Error, "Failed to create helper input pipe.");
     }
     let mut child_stdin_read = HandleGuard(stdin_read_raw);
     let mut parent_stdin_write = HandleGuard(stdin_write_raw);
@@ -168,10 +173,7 @@ pub fn invoke_auth_helper_at(
     // SAFETY: Creates anonymous output pipe with `4096`-byte kernel buffer.
     if unsafe { CreatePipe(&mut stdout_read_raw, &mut stdout_write_raw, Some(&sa), 4096) }.is_err()
     {
-        return HelperResponse::Failure {
-            icon: HelperIcon::Error,
-            message: "Failed to create helper output pipe.".into(),
-        };
+        return generic_failure(HelperIcon::Error, "Failed to create helper output pipe.");
     }
     let parent_stdout_read = HandleGuard(stdout_read_raw);
     let mut child_stdout_write = HandleGuard(stdout_write_raw);
@@ -192,20 +194,20 @@ pub fn invoke_auth_helper_at(
             )
             .is_err()
         {
-            return HelperResponse::Failure {
-                icon: HelperIcon::Error,
-                message: "Failed to configure helper pipe inheritance.".into(),
-            };
+            return generic_failure(
+                HelperIcon::Error,
+                "Failed to configure helper pipe inheritance.",
+            );
         }
     }
 
     // Write the entire bounded request frame (`<= 1026` bytes) into the 4096-byte kernel
     // pipe buffer and immediately close the write end so the child observes EOF cleanly.
     if write_framed(PipeWriter(parent_stdin_write.raw()), &encoded_req).is_err() {
-        return HelperResponse::Failure {
-            icon: HelperIcon::Error,
-            message: "Failed to send request to authentication helper.".into(),
-        };
+        return generic_failure(
+            HelperIcon::Error,
+            "Failed to send request to authentication helper.",
+        );
     }
     parent_stdin_write.close_now();
 
@@ -249,10 +251,7 @@ pub fn invoke_auth_helper_at(
     child_stdout_write.close_now();
 
     if spawn_res.is_err() {
-        return HelperResponse::Failure {
-            icon: HelperIcon::Error,
-            message: "Failed to launch authentication helper.".into(),
-        };
+        return generic_failure(HelperIcon::Error, "Failed to launch authentication helper.");
     }
 
     let proc_handle = HandleGuard(proc_info.hProcess);
@@ -267,16 +266,16 @@ pub fn invoke_auth_helper_at(
             let _ = TerminateProcess(proc_handle.raw(), 1);
             let _ = WaitForSingleObject(proc_handle.raw(), 1_000);
         }
-        return HelperResponse::Failure {
-            icon: HelperIcon::Warning,
-            message: "Smart card timed out. Check RS-Key / RDP redirection, or click Sign-in options to use your recovery password.".into(),
-        };
+        return generic_failure(
+            HelperIcon::Warning,
+            "Smart card timed out. Check RS-Key / RDP redirection, or click Sign-in options to use your recovery password.",
+        );
     }
     if wait_status != WAIT_OBJECT_0 {
-        return HelperResponse::Failure {
-            icon: HelperIcon::Error,
-            message: "Waiting on authentication helper failed.".into(),
-        };
+        return generic_failure(
+            HelperIcon::Error,
+            "Waiting on authentication helper failed.",
+        );
     }
 
     // Child has exited and write end is closed; `ReadFile` is guaranteed non-blocking.
@@ -298,24 +297,26 @@ pub fn invoke_auth_helper_at(
         }
         let n = read_n as usize;
         if raw_out.len() + n > MAX_IPC_FRAME_LEN + 4 {
-            return HelperResponse::Failure {
-                icon: HelperIcon::Error,
-                message: "Authentication helper returned an oversized response.".into(),
-            };
+            return generic_failure(
+                HelperIcon::Error,
+                "Authentication helper returned an oversized response.",
+            );
         }
         raw_out.extend_from_slice(&chunk[..n]);
     }
 
     let Ok(frame) = read_framed(Cursor::new(raw_out.as_slice())) else {
-        return HelperResponse::Failure {
-            icon: HelperIcon::Error,
-            message: "Authentication helper exited without a valid response.".into(),
-        };
+        return generic_failure(
+            HelperIcon::Error,
+            "Authentication helper exited without a valid response.",
+        );
     };
 
-    HelperResponse::decode(&frame).unwrap_or(HelperResponse::Failure {
-        icon: HelperIcon::Error,
-        message: "Malformed response from authentication helper.".into(),
+    HelperResponse::decode(&frame).unwrap_or_else(|_| {
+        generic_failure(
+            HelperIcon::Error,
+            "Malformed response from authentication helper.",
+        )
     })
 }
 
@@ -342,7 +343,9 @@ mod tests {
             sid: "S-1-5-21-1000-1001".into(),
             username: "nobody".into(),
             computer: "LOCAL".into(),
-            pin: Zeroizing::new(b"123456".to_vec()),
+            operation: scard_core::ipc::HelperOperation::Unlock {
+                pin: Zeroizing::new(b"123456".to_vec()),
+            },
         };
         let resp =
             invoke_auth_helper_at(Path::new(r"C:\nonexistent\no_helper.exe"), &[], &req, 500);
@@ -358,7 +361,9 @@ mod tests {
             sid: "S-1-5-21-1000-1001".into(),
             username: "nobody".into(),
             computer: "LOCAL".into(),
-            pin: Zeroizing::new(b"123456".to_vec()),
+            operation: scard_core::ipc::HelperOperation::Unlock {
+                pin: Zeroizing::new(b"123456".to_vec()),
+            },
         };
         let start = std::time::Instant::now();
         let resp = invoke_auth_helper_at(&helper, &["--test-simulate-hang"], &req, 250);
@@ -368,7 +373,7 @@ mod tests {
             "helper was not killed promptly: {elapsed:?}"
         );
         match resp {
-            HelperResponse::Failure { icon, message } => {
+            HelperResponse::Failure { icon, message, .. } => {
                 assert_eq!(icon, HelperIcon::Warning);
                 assert!(message.contains("timed out"));
             }

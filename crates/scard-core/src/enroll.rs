@@ -18,7 +18,9 @@ use crate::crypto::{
 };
 use crate::error::{AuthError, Result};
 use crate::pcsc::{ScardContext, SCARD_LEAVE_CARD};
-use crate::piv::{validate_slot_9d_policy, PivSession, SLOT_KEY_MANAGEMENT, TOUCH_POLICY_NEVER};
+use crate::piv::{
+    validate_slot_9d_policy, PivSession, KEY_REF_PIN, SLOT_KEY_MANAGEMENT, TOUCH_POLICY_NEVER,
+};
 use crate::storage::{read_pinned_f9, write_pinned_f9};
 use crate::vault::{
     aad_password, aad_wrap, pad_password, AadPasswordParams, VaultBlob, ALG_P256, APP_PIV,
@@ -302,6 +304,172 @@ pub fn enroll(
         password_last_set,
         attestation_policy: AttestationPolicy::SelfTestOnly,
     })
+}
+
+/// Read-only query of remaining PIV PIN attempts on the enrolled RS-Key matching
+/// `expected_fingerprint`. Leaves non-matching and matching cards undisturbed (`SCARD_LEAVE_CARD`).
+pub fn query_card_pin_remaining(
+    reader: Option<&str>,
+    expected_fingerprint: &[u8; 32],
+) -> Result<Option<u8>> {
+    let context = ScardContext::new()?;
+    let readers = match reader {
+        Some(r) => vec![r.to_string()],
+        None => context.list_readers()?,
+    };
+    if readers.is_empty() {
+        return Err(AuthError::NoReader);
+    }
+
+    let mut last_error = None;
+    for reader_name in readers {
+        let mut card = match context.connect(&reader_name) {
+            Ok(c) => c,
+            Err(e) => {
+                last_error = Some(e);
+                continue;
+            }
+        };
+        if let Err(e) = card.begin_transaction() {
+            last_error = Some(e);
+            continue;
+        }
+        let check: Result<Option<u8>> = (|| {
+            let session = PivSession::new(&card);
+            session.select()?;
+            let pub_9d = session.read_ec_public_key(SLOT_KEY_MANAGEMENT)?;
+            if !constant_time_eq(&sha256(&pub_9d), expected_fingerprint) {
+                return Err(AuthError::WrongCard);
+            }
+            Ok(session
+                .get_pin_puk_metadata(KEY_REF_PIN)?
+                .and_then(|m| m.remaining_retries))
+        })();
+
+        let _ = card.end_transaction(SCARD_LEAVE_CARD);
+        let _ = card.disconnect(SCARD_LEAVE_CARD);
+
+        match check {
+            Ok(rem) => return Ok(rem),
+            Err(e) => last_error = Some(e),
+        }
+    }
+
+    Err(last_error.unwrap_or(AuthError::NoCard))
+}
+
+/// Unblock a PIV card's Application PIN using `puk` and set `new_pin` (`00 2C 00 80`).
+///
+/// When `expected_fingerprint` is `Some`, only the enrolled RS-Key matching that
+/// slot `0x9D` public-key fingerprint is targeted so PUK attempts are never sent
+/// to an unrelated smart card. Returns the slot `0x9D` fingerprint if present.
+pub fn unblock_card_pin(
+    reader: Option<&str>,
+    expected_fingerprint: Option<&[u8; 32]>,
+    puk: &[u8],
+    new_pin: &[u8],
+) -> Result<Option<[u8; 32]>> {
+    // Validate input lengths/charset before touching any reader.
+    let _ = crate::piv::pad_puk_bytes(puk)?;
+    let _ = crate::piv::pad_pin_bytes(new_pin)?;
+
+    let context = ScardContext::new()?;
+    let readers = match reader {
+        Some(r) => vec![r.to_string()],
+        None => context.list_readers()?,
+    };
+    if readers.is_empty() {
+        return Err(AuthError::NoReader);
+    }
+
+    let mut last_error = None;
+    for reader_name in readers {
+        let mut card = match context.connect(&reader_name) {
+            Ok(c) => c,
+            Err(e) => {
+                last_error = Some(e);
+                continue;
+            }
+        };
+        if let Err(e) = card.begin_transaction() {
+            last_error = Some(e);
+            continue;
+        }
+
+        let attempt: Result<Option<[u8; 32]>> = (|| {
+            let session = PivSession::new(&card);
+            session.select()?;
+
+            let fp_opt = match session.read_ec_public_key(SLOT_KEY_MANAGEMENT) {
+                Ok(pub_9d) => Some(sha256(&pub_9d)),
+                Err(_) if expected_fingerprint.is_none() => None,
+                Err(e) => return Err(e),
+            };
+
+            if let Some(expected) = expected_fingerprint {
+                let actual = fp_opt.ok_or(AuthError::WrongCard)?;
+                if !constant_time_eq(&actual, expected) {
+                    return Err(AuthError::WrongCard);
+                }
+            }
+
+            session.reset_pin_with_puk(puk, new_pin)?;
+            Ok(fp_opt)
+        })();
+
+        match attempt {
+            Ok(fp_opt) => return Ok(fp_opt),
+            // Terminal PUK errors on the matched card must stop immediately!
+            Err(e @ AuthError::PukIncorrect(_)) | Err(e @ AuthError::PukBlocked) => return Err(e),
+            Err(e) => last_error = Some(e),
+        }
+    }
+
+    Err(last_error.unwrap_or(AuthError::NoCard))
+}
+
+/// Change a PIV card's PUK (`00 24 00 81`) from `current_puk` to `new_puk`.
+pub fn change_card_puk(reader: Option<&str>, current_puk: &[u8], new_puk: &[u8]) -> Result<()> {
+    let _ = crate::piv::pad_puk_bytes(current_puk)?;
+    let _ = crate::piv::pad_puk_bytes(new_puk)?;
+
+    let context = ScardContext::new()?;
+    let readers = match reader {
+        Some(r) => vec![r.to_string()],
+        None => context.list_readers()?,
+    };
+    if readers.is_empty() {
+        return Err(AuthError::NoReader);
+    }
+
+    let mut last_error = None;
+    for reader_name in readers {
+        let mut card = match context.connect(&reader_name) {
+            Ok(c) => c,
+            Err(e) => {
+                last_error = Some(e);
+                continue;
+            }
+        };
+        if let Err(e) = card.begin_transaction() {
+            last_error = Some(e);
+            continue;
+        }
+
+        let attempt: Result<()> = (|| {
+            let session = PivSession::new(&card);
+            session.select()?;
+            session.change_puk(current_puk, new_puk)
+        })();
+
+        match attempt {
+            Ok(()) => return Ok(()),
+            Err(e @ AuthError::PukIncorrect(_)) | Err(e @ AuthError::PukBlocked) => return Err(e),
+            Err(e) => last_error = Some(e),
+        }
+    }
+
+    Err(last_error.unwrap_or(AuthError::NoCard))
 }
 
 fn unix_now() -> u64 {

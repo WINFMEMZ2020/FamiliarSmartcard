@@ -150,9 +150,38 @@ rescue_delete_cp.reg         # WinRE / 安全模式救援注册表文件
 
 ---
 
-## 6. 应急救援流程
+## 6. RS-Key PIN 防误锁保护、PUK 原地解锁与应急救援流程
 
-1. **首选救援**：在锁屏点击“登录选项（Sign-in options）”，切换回 Windows 原生密码图标，输入纸质恢复单上的 36 位随机密码（**包含连字符 `-`**）进入桌面。
+### 6.1 最后 1 次机会前的 60 秒防误触冷却保护
+RS-Key 硬件固件默认最多允许连续输错 **3 次** PIV PIN。为防止手滑连按回车直接把硬件锁死：
+- 前 **2 次** 输错（剩余 2 次 -> 剩余 1 次）后，主机立即为该卡启动 **60 秒强制安全冷却**；
+- 冷却期间再次提交不会向卡片发送 `VERIFY PIN`，因此不会消耗最后 1 次宝贵的硬件机会；
+- 60 秒结束后放行第 3 次（最后 1 次）尝试；验证成功则卡片自动恢复满额 3 次计数。
+
+### 6.2 卡片 PIN 锁死（`6983`）时：使用 PUK 原地救卡（无需重新绑卡！）
+无论是 `Set up & rotate` 还是 `Re-bind current password` 模式，RS-Key 硬件内部都自带独立的 **PIV PUK 码**（刷机出厂默认为 `12345678`；正式使用前建议通过下方 GUI 或 CLI 修改为你自己的 6–8 位 PUK 并离线抄写保存）。**通过 PUK 重置 PIN 不会改变 `0x9D` 密钥对，原有 Windows Vault 无需重新绑定即可继续使用。**
+
+1. **方法 A：直接在 Windows 锁屏界面原地解锁并登录**
+   - 当第 3 次输错触发硬件锁定后，锁屏磁贴会自动展开 **`Unblock RS-Key with PUK`** 模式（平时也可主动点击磁贴下方的 `PIN blocked? Unblock with PUK` 链接切换）；
+   - 填入 **Card PUK**（未改过则为 `12345678`）、**New PIN** 与 **Confirm new PIN** 后回车，即可一次性解锁卡片（恢复 3 次计数）并直接登录进入桌面。
+2. **方法 B：通过 `familiar-enroll.exe` 图形界面管理 PIN 解锁与修改 PUK**
+   - 打开 `familiar-enroll.exe`，点击第二排的 **`Unblock PIN / PUK...`** 按钮；
+   - 上半区可用 PUK 解锁已锁死的 PIN 并恢复 3 次计数；下半区可将出厂默认 PUK（`12345678`）修改为你自己的 6–8 位高强度 PUK。
+3. **方法 C：通过 CLI 命令行解锁 PIN 或修改 PUK**
+   ```powershell
+   # 查看当前卡片 PIN / PUK 剩余次数及是否仍为出厂默认值
+   .\familiar-enroll.exe --probe
+
+   # 用 PUK 解锁已锁死的 PIN 并设置新 PIN（恢复 3 次机会）
+   .\familiar-enroll.exe --unblock-pin <PUK> <NEW-PIN>
+
+   # 修改卡片 PUK（将默认 12345678 改为自定义 6-8 位 PUK）
+   .\familiar-enroll.exe --change-puk <CURRENT-PUK> <NEW-PUK>
+   ```
+
+### 6.3 系统应急救援流程（未带卡或卡片损坏）
+
+1. **首选救援**：在锁屏点击“登录选项（Sign-in options）”，切换回 Windows 原生密码图标，输入纸质恢复单上的 36 位随机密码（**包含连字符 `-`**；若为 `Re-bind` 模式则输入原本的 Windows 密码）进入桌面。
 2. **注销自定义 Credential Provider**：
    进入桌面后在管理员 PowerShell 运行：
    ```powershell

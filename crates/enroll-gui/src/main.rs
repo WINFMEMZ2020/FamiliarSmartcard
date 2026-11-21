@@ -6,6 +6,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod installer;
+mod puk_dialog;
 mod recovery;
 
 use recovery::{confirm_recovery_sheet, RecoverySheet};
@@ -15,15 +16,16 @@ use scard_core::account::{
 };
 use scard_core::crypto::generate_recovery_password;
 use scard_core::enroll::{
-    enroll_with_options, repin_connected_card_attestation, AttestationPolicy, EnrollOptions,
+    change_card_puk, enroll_with_options, repin_connected_card_attestation, unblock_card_pin,
+    AttestationPolicy, EnrollOptions,
 };
 use scard_core::piv::{
-    ORIGIN_GENERATED, ORIGIN_IMPORTED, PIN_POLICY_ALWAYS, PIN_POLICY_NEVER, PIN_POLICY_ONCE,
-    TOUCH_POLICY_ALWAYS, TOUCH_POLICY_CACHED, TOUCH_POLICY_NEVER,
+    PinPukMetadata, ORIGIN_GENERATED, ORIGIN_IMPORTED, PIN_POLICY_ALWAYS, PIN_POLICY_NEVER,
+    PIN_POLICY_ONCE, TOUCH_POLICY_ALWAYS, TOUCH_POLICY_CACHED, TOUCH_POLICY_NEVER,
 };
 use scard_core::storage::{
-    clear_pinned_f9, read_pinned_f9, read_vault, stage_pending_vault_with_backup,
-    write_touch_policy, write_vault,
+    clear_last_attempt_cooldown, clear_pinned_f9, read_pinned_f9, read_vault,
+    stage_pending_vault_with_backup, write_touch_policy, write_vault,
 };
 use scard_core::VaultBlob;
 use std::ffi::c_void;
@@ -60,6 +62,7 @@ const ID_SELFTEST: usize = 1004;
 const ID_REPIN_ROOT: usize = 1005;
 const ID_REGISTER: usize = 1006;
 const ID_CLEAR: usize = 1007;
+const ID_MANAGE_PUK: usize = 1008;
 
 const WM_WORKER_RESULT: u32 = WM_APP + 10;
 
@@ -72,7 +75,7 @@ struct AppState {
     output: HWND,
     pin: HWND,
     password: HWND,
-    buttons: [HWND; 7],
+    buttons: [HWND; 8],
     busy: bool,
 }
 
@@ -117,6 +120,24 @@ fn main() -> windows::core::Result<()> {
             }
             "--repin-attestation" => return repin_attestation_cli(),
             "--clear-attestation" => return clear_attestation_cli(),
+            "--unblock-pin" => {
+                let Some((puk, new_pin)) = args.get(2).zip(args.get(3)) else {
+                    eprintln!("Usage: familiar-enroll.exe --unblock-pin <PUK> <NEW-PIN>\n");
+                    return Err(windows::core::Error::from_hresult(
+                        windows::Win32::Foundation::E_INVALIDARG,
+                    ));
+                };
+                return unblock_pin_cli(puk, new_pin);
+            }
+            "--change-puk" => {
+                let Some((cur_puk, new_puk)) = args.get(2).zip(args.get(3)) else {
+                    eprintln!("Usage: familiar-enroll.exe --change-puk <CURRENT-PUK> <NEW-PUK>\n");
+                    return Err(windows::core::Error::from_hresult(
+                        windows::Win32::Foundation::E_INVALIDARG,
+                    ));
+                };
+                return change_puk_cli(cur_puk, new_puk);
+            }
             _ => {
                 eprintln!("Unknown option: {flag}\n");
                 print_cli_help();
@@ -181,11 +202,13 @@ fn print_cli_help() {
     println!(
         "FamiliarSmartcard Setup & Diagnostics\n\n\
          Usage:\n\
-         \x20 familiar-enroll.exe                        Launch elevated Win32 setup GUI\n\
-         \x20 familiar-enroll.exe --probe                Read-only reader, 0x9D policy & 0xF9 attestation probe\n\
-         \x20 familiar-enroll.exe --card-selftest [PIN]  Stateless card ECDH/AES-GCM self-test (no registry writes)\n\
-         \x20 familiar-enroll.exe --repin-attestation    Verify & re-pin connected card's 0xF9 root in HKLM (Admin)\n\
-         \x20 familiar-enroll.exe --clear-attestation    Clear pinned 0xF9 root from HKLM (Admin)\n"
+         \x20 familiar-enroll.exe                                Launch elevated Win32 setup GUI\n\
+         \x20 familiar-enroll.exe --probe                        Read-only reader, PIN/PUK, 0x9D policy & 0xF9 attestation probe\n\
+         \x20 familiar-enroll.exe --card-selftest [PIN]          Stateless card ECDH/AES-GCM self-test (no registry writes)\n\
+         \x20 familiar-enroll.exe --unblock-pin <PUK> <NEW-PIN>  Unblock PIV PIN via PUK (00 2C 00 80) and reset retries to 3\n\
+         \x20 familiar-enroll.exe --change-puk <CUR> <NEW>       Change card PUK via 00 24 00 81 (factory default: 12345678)\n\
+         \x20 familiar-enroll.exe --repin-attestation            Verify & re-pin connected card's 0xF9 root in HKLM (Admin)\n\
+         \x20 familiar-enroll.exe --clear-attestation            Clear pinned 0xF9 root from HKLM (Admin)\n"
     );
 }
 
@@ -361,6 +384,44 @@ fn clear_attestation_cli() -> windows::core::Result<()> {
     }
 }
 
+fn unblock_pin_cli(puk_arg: &str, new_pin_arg: &str) -> windows::core::Result<()> {
+    let puk = Zeroizing::new(puk_arg.as_bytes().to_vec());
+    let new_pin = Zeroizing::new(new_pin_arg.as_bytes().to_vec());
+    match unblock_card_pin(None, None, &puk, &new_pin) {
+        Ok(fp_opt) => {
+            if let Some(fp) = fp_opt {
+                let _ = clear_last_attempt_cooldown(&fp);
+            }
+            println!("Successfully unblocked RS-Key PIV PIN and restored retry counter to 3.");
+            println!("Existing Windows vaults remain valid with the new PIN.");
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!("Unblock PIN failed: {error}");
+            Err(windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_FAIL,
+            ))
+        }
+    }
+}
+
+fn change_puk_cli(cur_puk_arg: &str, new_puk_arg: &str) -> windows::core::Result<()> {
+    let cur_puk = Zeroizing::new(cur_puk_arg.as_bytes().to_vec());
+    let new_puk = Zeroizing::new(new_puk_arg.as_bytes().to_vec());
+    match change_card_puk(None, &cur_puk, &new_puk) {
+        Ok(()) => {
+            println!("Successfully updated RS-Key PIV PUK. Keep the new PUK stored offline.");
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!("Change PUK failed: {error}");
+            Err(windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_FAIL,
+            ))
+        }
+    }
+}
+
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // SAFETY: Main Win32 window procedure.
     unsafe {
@@ -377,6 +438,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     ID_REBIND_EXISTING => start_rebind_existing_password(hwnd),
                     ID_PROBE => spawn_probe_worker(hwnd, true),
                     ID_SELFTEST => start_self_test(hwnd),
+                    ID_MANAGE_PUK => {
+                        if !state_mut(hwnd).map(|s| s.busy).unwrap_or(true) {
+                            if let Some(log) = puk_dialog::show_puk_management_dialog(hwnd) {
+                                set_status(hwnd, "Card PIN / PUK operation completed.");
+                                set_output(hwnd, &log);
+                            }
+                        }
+                    }
                     ID_REPIN_ROOT => start_repin_card_root(hwnd),
                     ID_REGISTER => start_register_provider(hwnd),
                     ID_CLEAR => {
@@ -518,14 +587,14 @@ unsafe fn create_controls(hwnd: HWND) {
         );
         set_font(btn_rebind, font);
 
-        // Row 2: Diagnostics, Attestation Pinning, Provider Registration
+        // Row 2: Diagnostics, PIN/PUK Recovery, Attestation Pinning, Provider Registration
         let btn_probe = create_control(
             hwnd,
             w!("BUTTON"),
             "Probe card",
             20,
             220,
-            115,
+            105,
             30,
             ID_PROBE as isize,
         );
@@ -535,21 +604,33 @@ unsafe fn create_controls(hwnd: HWND) {
             hwnd,
             w!("BUTTON"),
             "Self-test vault",
-            145,
+            133,
             220,
-            125,
+            120,
             30,
             ID_SELFTEST as isize,
         );
         set_font(btn_selftest, font);
 
+        let btn_puk = create_control(
+            hwnd,
+            w!("BUTTON"),
+            "Unblock PIN / PUK...",
+            261,
+            220,
+            165,
+            30,
+            ID_MANAGE_PUK as isize,
+        );
+        set_font(btn_puk, font);
+
         let btn_repin = create_control(
             hwnd,
             w!("BUTTON"),
             "Re-pin card root",
-            280,
+            434,
             220,
-            145,
+            140,
             30,
             ID_REPIN_ROOT as isize,
         );
@@ -559,9 +640,9 @@ unsafe fn create_controls(hwnd: HWND) {
             hwnd,
             w!("BUTTON"),
             "Register provider",
-            435,
+            582,
             220,
-            150,
+            145,
             30,
             ID_REGISTER as isize,
         );
@@ -571,7 +652,7 @@ unsafe fn create_controls(hwnd: HWND) {
             hwnd,
             w!("BUTTON"),
             "Clear output",
-            595,
+            735,
             220,
             115,
             30,
@@ -612,6 +693,7 @@ unsafe fn create_controls(hwnd: HWND) {
                 btn_rebind,
                 btn_probe,
                 btn_selftest,
+                btn_puk,
                 btn_repin,
                 btn_register,
                 btn_clear,
@@ -1524,6 +1606,25 @@ fn format_origin(v: Option<u8>) -> &'static str {
     }
 }
 
+fn format_pin_puk_line(label: &str, default_val: &str, meta: &Option<PinPukMetadata>) -> String {
+    let Some(m) = meta else {
+        return format!("  {label}: not reported\r\n");
+    };
+    let retries = match (m.remaining_retries, m.total_retries) {
+        (Some(0), Some(tot)) => format!("0/{tot} (BLOCKED)"),
+        (Some(0), None) => "0 (BLOCKED)".into(),
+        (Some(rem), Some(tot)) => format!("{rem}/{tot} attempts remaining"),
+        (Some(rem), None) => format!("{rem} attempt(s) remaining"),
+        (None, _) => "retries unknown".into(),
+    };
+    let def_note = match m.is_default {
+        Some(true) => format!(" [FACTORY DEFAULT {default_val} — change recommended]"),
+        Some(false) => " [custom]".into(),
+        None => String::new(),
+    };
+    format!("  {label}: {retries}{def_note}\r\n")
+}
+
 fn format_readers(readers: &[scard_core::ReaderProbe], pinned_f9: Option<&str>) -> String {
     let mut out = String::new();
     if let Some(pin_hex) = pinned_f9 {
@@ -1545,6 +1646,16 @@ fn format_readers(readers: &[scard_core::ReaderProbe], pinned_f9: Option<&str>) 
             out.push_str(&format!(
                 "  Algorithms: {}\r\n",
                 hex::encode(&reader.algorithms)
+            ));
+            out.push_str(&format_pin_puk_line(
+                "PIN Status",
+                "123456",
+                &reader.pin_metadata,
+            ));
+            out.push_str(&format_pin_puk_line(
+                "PUK Status",
+                "12345678",
+                &reader.puk_metadata,
             ));
             match (&reader.f9_fingerprint_hex, reader.attestation_verified) {
                 (Some(f9_hex), true) => {

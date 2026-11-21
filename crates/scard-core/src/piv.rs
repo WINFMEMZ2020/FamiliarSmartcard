@@ -18,6 +18,8 @@ pub const SLOT_PIV_AUTH: u8 = 0x9A;
 pub const SLOT_DIGITAL_SIGNATURE: u8 = 0x9C;
 pub const SLOT_CARD_AUTH: u8 = 0x9E;
 pub const SLOT_ATTESTATION: u8 = 0xF9;
+pub const KEY_REF_PIN: u8 = 0x80;
+pub const KEY_REF_PUK: u8 = 0x81;
 
 pub const ALG_ECC_P256: u8 = 0x11;
 pub const ALG_ECC_P384: u8 = 0x14;
@@ -92,7 +94,29 @@ pub struct SlotPolicy {
     pub public_key_sec1: Option<Vec<u8>>,
 }
 
+/// Read-only PIN (`0x80`) or PUK (`0x81`) status from Yubico/RS-Key `GET METADATA`
+/// (with standard NIST SP 800-73-4 empty `VERIFY` fallback for PIN).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinPukMetadata {
+    pub is_default: Option<bool>,
+    pub total_retries: Option<u8>,
+    pub remaining_retries: Option<u8>,
+}
+
 impl SlotMetadata {
+    pub fn parse_pin_puk(&self) -> PinPukMetadata {
+        let is_default = find_tlv(&self.raw, 0x05).and_then(|v| v.first().map(|&b| b != 0));
+        let (total_retries, remaining_retries) = match find_tlv(&self.raw, 0x06) {
+            Some(v) if v.len() >= 2 => (Some(v[0]), Some(v[1])),
+            Some(v) if v.len() == 1 => (None, Some(v[0])),
+            _ => (None, None),
+        };
+        PinPukMetadata {
+            is_default,
+            total_retries,
+            remaining_retries,
+        }
+    }
     pub fn parse(&self) -> SlotPolicy {
         let algorithm = find_tlv(&self.raw, 0x01).and_then(|v| v.first().copied());
         let policy = find_tlv(&self.raw, 0x02);
@@ -359,15 +383,52 @@ impl<'a, T: ApduTransport + ?Sized> PivSession<'a, T> {
         crate::attestation::extract_cert_public_key_bytes(&cert_der)
     }
 
+    /// Query read-only PIN (`0x80`) or PUK (`0x81`) retry/default metadata without
+    /// consuming any retry attempt.
+    pub fn get_pin_puk_metadata(&self, key_ref: u8) -> Result<Option<PinPukMetadata>> {
+        if let Some(meta) = self.get_metadata(key_ref)? {
+            let parsed = meta.parse_pin_puk();
+            if parsed.remaining_retries.is_some() || parsed.is_default.is_some() {
+                return Ok(Some(parsed));
+            }
+        }
+
+        // Standard NIST SP 800-73-4 read-only status probe for PIV Application PIN (0x80):
+        // VERIFY with absent command data never decrements the retry counter.
+        if key_ref == KEY_REF_PIN {
+            let resp = self.transmit(&[0x00, 0x20, 0x00, KEY_REF_PIN])?;
+            let resp = if resp.sw1 == 0x67 && resp.sw2 == 0x00 {
+                self.transmit(&[0x00, 0x20, 0x00, KEY_REF_PIN, 0x00])?
+            } else {
+                resp
+            };
+            match (resp.sw1, resp.sw2) {
+                (0x63, sw2) if (sw2 & 0xF0) == 0xC0 => {
+                    return Ok(Some(PinPukMetadata {
+                        is_default: None,
+                        total_retries: None,
+                        remaining_retries: Some(sw2 & 0x0F),
+                    }));
+                }
+                (0x69, 0x83) => {
+                    return Ok(Some(PinPukMetadata {
+                        is_default: None,
+                        total_retries: None,
+                        remaining_retries: Some(0),
+                    }));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(None)
+    }
+
     /// VERIFY the PIV PIN.
     ///
     /// PIV PINs are 6-8 ASCII digits and are padded to 8 bytes with 0xFF.
     pub fn verify_pin(&self, pin: &[u8]) -> Result<()> {
-        if pin.len() < 6 || pin.len() > 8 {
-            return Err(AuthError::PinRequired);
-        }
-        let mut padded = Zeroizing::new([0xFFu8; 8]);
-        padded[..pin.len()].copy_from_slice(pin);
+        let padded = pad_pin_bytes(pin)?;
 
         let mut apdu = Zeroizing::new(vec![0x00, 0x20, 0x00, 0x80, 0x08, 0, 0, 0, 0, 0, 0, 0, 0]);
         apdu[5..13].copy_from_slice(&padded[..]);
@@ -376,8 +437,58 @@ impl<'a, T: ApduTransport + ?Sized> PivSession<'a, T> {
         let response = self.transmit(&apdu)?;
         match (response.sw1, response.sw2) {
             (0x90, 0x00) => Ok(()),
-            (0x63, sw2) => Err(AuthError::PinIncorrect(sw2 & 0x0F)),
-            (0x69, 0x83) => Err(AuthError::PinBlocked),
+            (0x63, 0xC0) | (0x69, 0x83) => Err(AuthError::PinBlocked),
+            (0x63, sw2) if (sw2 & 0xF0) == 0xC0 => Err(AuthError::PinIncorrect(sw2 & 0x0F)),
+            _ => Err(AuthError::Apdu {
+                sw1: response.sw1,
+                sw2: response.sw2,
+            }),
+        }
+    }
+
+    /// NIST SP 800-73-4 `RESET RETRY COUNTER` (`00 2C 00 80 10 <8B PUK> <8B New PIN>`).
+    ///
+    /// Unblocks a blocked PIV Application PIN using the 6-8 char PUK, sets `new_pin`,
+    /// and restores the card's PIN retry counter to its maximum (3).
+    /// Slot `0x9D` key material is untouched, so existing vaults remain valid.
+    pub fn reset_pin_with_puk(&self, puk: &[u8], new_pin: &[u8]) -> Result<()> {
+        let padded_puk = pad_puk_bytes(puk)?;
+        let padded_pin = pad_pin_bytes(new_pin)?;
+
+        let mut apdu = Zeroizing::new(vec![0u8; 21]);
+        apdu[0..5].copy_from_slice(&[0x00, 0x2C, 0x00, KEY_REF_PIN, 0x10]);
+        apdu[5..13].copy_from_slice(&padded_puk[..]);
+        apdu[13..21].copy_from_slice(&padded_pin[..]);
+
+        self.card.mark_pin_attempted();
+        let response = self.transmit(&apdu)?;
+        match (response.sw1, response.sw2) {
+            (0x90, 0x00) => Ok(()),
+            (0x63, 0xC0) | (0x69, 0x83) => Err(AuthError::PukBlocked),
+            (0x63, sw2) if (sw2 & 0xF0) == 0xC0 => Err(AuthError::PukIncorrect(sw2 & 0x0F)),
+            _ => Err(AuthError::Apdu {
+                sw1: response.sw1,
+                sw2: response.sw2,
+            }),
+        }
+    }
+
+    /// NIST SP 800-73-4 `CHANGE REFERENCE DATA` for PUK (`00 24 00 81 10 <8B Current PUK> <8B New PUK>`).
+    pub fn change_puk(&self, current_puk: &[u8], new_puk: &[u8]) -> Result<()> {
+        let padded_cur = pad_puk_bytes(current_puk)?;
+        let padded_new = pad_puk_bytes(new_puk)?;
+
+        let mut apdu = Zeroizing::new(vec![0u8; 21]);
+        apdu[0..5].copy_from_slice(&[0x00, 0x24, 0x00, KEY_REF_PUK, 0x10]);
+        apdu[5..13].copy_from_slice(&padded_cur[..]);
+        apdu[13..21].copy_from_slice(&padded_new[..]);
+
+        self.card.mark_pin_attempted();
+        let response = self.transmit(&apdu)?;
+        match (response.sw1, response.sw2) {
+            (0x90, 0x00) => Ok(()),
+            (0x63, 0xC0) | (0x69, 0x83) => Err(AuthError::PukBlocked),
+            (0x63, sw2) if (sw2 & 0xF0) == 0xC0 => Err(AuthError::PukIncorrect(sw2 & 0x0F)),
             _ => Err(AuthError::Apdu {
                 sw1: response.sw1,
                 sw2: response.sw2,
@@ -428,6 +539,26 @@ impl<'a, T: ApduTransport + ?Sized> PivSession<'a, T> {
         })?;
         Ok(secret.to_vec())
     }
+}
+
+/// Validate and pad a 6-8 ASCII digit PIV PIN to 8 bytes with `0xFF`.
+pub fn pad_pin_bytes(pin: &[u8]) -> Result<Zeroizing<[u8; 8]>> {
+    if pin.len() < 6 || pin.len() > 8 || !pin.iter().all(|b| b.is_ascii_digit()) {
+        return Err(AuthError::PinRequired);
+    }
+    let mut padded = Zeroizing::new([0xFFu8; 8]);
+    padded[..pin.len()].copy_from_slice(pin);
+    Ok(padded)
+}
+
+/// Validate and pad a 6-8 printable ASCII PIV PUK (`0x21..=0x7E`) to 8 bytes with `0xFF`.
+pub fn pad_puk_bytes(puk: &[u8]) -> Result<Zeroizing<[u8; 8]>> {
+    if puk.len() < 6 || puk.len() > 8 || !puk.iter().all(|&b| (0x21..=0x7E).contains(&b)) {
+        return Err(AuthError::PukRequired);
+    }
+    let mut padded = Zeroizing::new([0xFFu8; 8]);
+    padded[..puk.len()].copy_from_slice(puk);
+    Ok(padded)
 }
 
 /// Unwrap either a raw X.509 DER SEQUENCE (`30 ...`) or a PIV `53 { 70 <DER> [71 <certInfo>] }` wrapper.
@@ -653,5 +784,74 @@ mod tests {
         assert_eq!(outer[1], 0x45);
         assert_eq!(&outer[2..6], &[0x82, 0x00, 0x85, 0x41]);
         assert_eq!(outer.len(), 71);
+    }
+
+    struct RecordingTransport {
+        sent: RefCell<Vec<Vec<u8>>>,
+        responses: RefCell<VecDeque<Vec<u8>>>,
+    }
+
+    impl ApduTransport for RecordingTransport {
+        fn transmit_apdu(&self, apdu: &[u8]) -> Result<Vec<u8>> {
+            self.sent.borrow_mut().push(apdu.to_vec());
+            self.responses
+                .borrow_mut()
+                .pop_front()
+                .ok_or_else(|| AuthError::Internal("mock out of responses".into()))
+        }
+    }
+
+    #[test]
+    fn reset_pin_with_puk_and_change_puk_format_and_status_codes() {
+        let transport = RecordingTransport {
+            sent: RefCell::new(Vec::new()),
+            responses: RefCell::new(VecDeque::from(vec![
+                vec![0x90, 0x00],
+                vec![0x63, 0xC2],
+                vec![0x63, 0xC0],
+                vec![0x90, 0x00],
+            ])),
+        };
+        let session = PivSession::new(&transport);
+
+        // 1. Valid RESET RETRY COUNTER (8-byte default PUK + 6-digit new PIN padded with 0xFF)
+        session.reset_pin_with_puk(b"12345678", b"654321").unwrap();
+        assert_eq!(
+            transport.sent.borrow()[0],
+            vec![
+                0x00, 0x2C, 0x00, 0x80, 0x10, b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'6',
+                b'5', b'4', b'3', b'2', b'1', 0xFF, 0xFF
+            ]
+        );
+
+        // 2. Wrong PUK with 2 attempts remaining
+        assert!(matches!(
+            session.reset_pin_with_puk(b"00000000", b"654321"),
+            Err(AuthError::PukIncorrect(2))
+        ));
+
+        // 3. 63 C0 (counter reached zero) maps directly to PukBlocked
+        assert!(matches!(
+            session.reset_pin_with_puk(b"00000000", b"654321"),
+            Err(AuthError::PukBlocked)
+        ));
+
+        // 4. CHANGE REFERENCE DATA for PUK (00 24 00 81 10)
+        session.change_puk(b"12345678", b"87654321").unwrap();
+        assert_eq!(
+            &transport.sent.borrow()[3][..5],
+            &[0x00, 0x24, 0x00, 0x81, 0x10]
+        );
+    }
+
+    #[test]
+    fn pin_puk_metadata_parses_default_and_retries() {
+        let meta = SlotMetadata {
+            raw: vec![0x05, 0x01, 0x01, 0x06, 0x02, 0x03, 0x01],
+        };
+        let parsed = meta.parse_pin_puk();
+        assert_eq!(parsed.is_default, Some(true));
+        assert_eq!(parsed.total_retries, Some(3));
+        assert_eq!(parsed.remaining_retries, Some(1));
     }
 }

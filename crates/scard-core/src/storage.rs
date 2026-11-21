@@ -37,6 +37,10 @@ use windows::Win32::System::Registry::{
 const ROOT_SUBKEY: &str = "SOFTWARE\\FamiliarSmartcard";
 const USERS_SUBKEY: &str = "SOFTWARE\\FamiliarSmartcard\\Users";
 const ATTESTATION_SUBKEY: &str = "SOFTWARE\\FamiliarSmartcard\\Attestation";
+const COOLDOWNS_SUBKEY: &str = "SOFTWARE\\FamiliarSmartcard\\Cooldowns";
+
+/// Safety cooldown enforced before the final (1 remaining) hardware PIN retry.
+pub const LAST_ATTEMPT_COOLDOWN_SECS: u64 = 60;
 
 const VALUE_VAULT: &str = "VaultBlob";
 const VALUE_VAULT_PENDING: &str = "VaultBlob.pending";
@@ -270,6 +274,7 @@ pub fn ensure_secured_vault_hierarchy() -> Result<()> {
     harden_hklm_subkey_acl(ROOT_SUBKEY)?;
     let _users = create_secured_hklm_key(USERS_SUBKEY)?;
     let _att = create_secured_hklm_key(ATTESTATION_SUBKEY)?;
+    let _cool = create_secured_hklm_key(COOLDOWNS_SUBKEY)?;
     Ok(())
 }
 
@@ -510,6 +515,100 @@ pub fn clear_pinned_f9() -> Result<bool> {
     Ok(existed)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CooldownDecision {
+    Expired,
+    Active {
+        remaining_secs: u64,
+    },
+    ClampBackwardJump {
+        clamped_until_unix: u64,
+        remaining_secs: u64,
+    },
+}
+
+fn evaluate_cooldown_deadline(until_unix: u64, now_unix: u64, max_secs: u64) -> CooldownDecision {
+    if now_unix >= until_unix {
+        return CooldownDecision::Expired;
+    }
+    let diff = until_unix - now_unix;
+    if diff > max_secs {
+        // System clock moved backwards; clamp deadline so cooldown never exceeds `max_secs`.
+        CooldownDecision::ClampBackwardJump {
+            clamped_until_unix: now_unix.saturating_add(max_secs),
+            remaining_secs: max_secs,
+        }
+    } else {
+        CooldownDecision::Active {
+            remaining_secs: diff,
+        }
+    }
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Record a mandatory safety cooldown (default 60s) for `card_fingerprint` when
+/// the card reaches 1 remaining PIN attempt (`63 C1`), preventing accidental
+/// rapid keypresses from locking the hardware card.
+pub fn start_last_attempt_cooldown(card_fingerprint: &[u8; 32], duration_secs: u64) -> Result<()> {
+    ensure_secured_vault_hierarchy()?;
+    let key = create_secured_hklm_key(COOLDOWNS_SUBKEY)?;
+    let name = hex::encode(card_fingerprint);
+    let capped = duration_secs.min(LAST_ATTEMPT_COOLDOWN_SECS);
+    let until = unix_now_secs().saturating_add(capped);
+    write_raw_reg_binary(key.0, &name, &until.to_le_bytes())
+}
+
+/// Check whether `card_fingerprint` has an active last-attempt cooldown.
+/// Returns `Ok(Some(remaining_secs))` if active, or `Ok(None)` if expired/absent.
+pub fn check_last_attempt_cooldown(card_fingerprint: &[u8; 32]) -> Result<Option<u64>> {
+    let name = hex::encode(card_fingerprint);
+    let Some(bytes) = read_raw_reg_binary(COOLDOWNS_SUBKEY, &name, 16)? else {
+        return Ok(None);
+    };
+    if bytes.len() != 8 {
+        let _ = clear_last_attempt_cooldown(card_fingerprint);
+        return Ok(None);
+    }
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&bytes);
+    let until = u64::from_le_bytes(raw);
+    let now = unix_now_secs();
+
+    match evaluate_cooldown_deadline(until, now, LAST_ATTEMPT_COOLDOWN_SECS) {
+        CooldownDecision::Expired => {
+            let _ = clear_last_attempt_cooldown(card_fingerprint);
+            Ok(None)
+        }
+        CooldownDecision::Active { remaining_secs } => Ok(Some(remaining_secs)),
+        CooldownDecision::ClampBackwardJump {
+            clamped_until_unix,
+            remaining_secs,
+        } => {
+            if let Ok(key) = create_secured_hklm_key(COOLDOWNS_SUBKEY) {
+                let _ = write_raw_reg_binary(key.0, &name, &clamped_until_unix.to_le_bytes());
+            }
+            Ok(Some(remaining_secs))
+        }
+    }
+}
+
+/// Clear any active last-attempt cooldown for `card_fingerprint` (e.g. after successful
+/// PIN login or PUK unblock).
+pub fn clear_last_attempt_cooldown(card_fingerprint: &[u8; 32]) -> Result<()> {
+    let Ok(key) = create_secured_hklm_key(COOLDOWNS_SUBKEY) else {
+        return Ok(());
+    };
+    let name = hex::encode(card_fingerprint);
+    delete_reg_value_ignore_missing(key.0, &name);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,5 +632,29 @@ mod tests {
         assert!(validate_sid_token("").is_err());
         assert!(validate_sid_token("S-1-5-21\\..\\Evil").is_err());
         assert!(validate_sid_token("Administrator").is_err());
+    }
+
+    #[test]
+    fn cooldown_deadline_handles_expiry_and_backwards_clock_jumps() {
+        assert_eq!(
+            evaluate_cooldown_deadline(1_060, 1_015, 60),
+            CooldownDecision::Active { remaining_secs: 45 }
+        );
+        assert_eq!(
+            evaluate_cooldown_deadline(1_060, 1_060, 60),
+            CooldownDecision::Expired
+        );
+        assert_eq!(
+            evaluate_cooldown_deadline(1_060, 1_200, 60),
+            CooldownDecision::Expired
+        );
+        // Backwards jump by 1 hour clamps remaining wait to 60s instead of 3660s!
+        assert_eq!(
+            evaluate_cooldown_deadline(5_000, 1_000, 60),
+            CooldownDecision::ClampBackwardJump {
+                clamped_until_unix: 1_060,
+                remaining_secs: 60,
+            }
+        );
     }
 }

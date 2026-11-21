@@ -19,10 +19,12 @@ pub mod vault;
 
 pub use account::{current_user, UserInfo};
 pub use enroll::{
-    enroll, enroll_with_options, repin_connected_card_attestation, AttestationPolicy,
-    EnrollOptions, EnrollResult,
+    change_card_puk, enroll, enroll_with_options, query_card_pin_remaining,
+    repin_connected_card_attestation, unblock_card_pin, AttestationPolicy, EnrollOptions,
+    EnrollResult,
 };
 pub use error::{AuthError, Result};
+pub use piv::PinPukMetadata;
 pub use probe::{probe_readers, ReaderProbe, SlotProbe};
 pub use typestate::{
     unlock, unlock_with_transport, AuthPipeline, CardConnected, CredentialDecrypted,

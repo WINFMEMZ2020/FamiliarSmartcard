@@ -51,6 +51,18 @@ pub enum AuthError {
     #[error("PIN is blocked; use the PUK or administration PIN to unblock")]
     PinBlocked,
 
+    #[error("final PIN attempt safety cooldown active ({remaining_secs}s remaining)")]
+    LastAttemptCooldown { remaining_secs: u64 },
+
+    #[error("PUK must be 6-8 printable ASCII characters")]
+    PukRequired,
+
+    #[error("PUK incorrect; remaining PUK attempts: {0}")]
+    PukIncorrect(u8),
+
+    #[error("PUK is permanently blocked; reset the PIV applet to recover the key")]
+    PukBlocked,
+
     #[error("APDU failed with SW={sw1:02X}{sw2:02X}")]
     Apdu { sw1: u8, sw2: u8 },
 

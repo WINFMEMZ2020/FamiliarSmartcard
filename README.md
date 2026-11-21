@@ -31,11 +31,17 @@ Release binaries in `target\release\`:
 ## CLI Commands
 
 ```powershell
-# Read-only probe: checks slot 0x9D policy (P-256, PIN ALWAYS, On-card) and 0xF9 attestation
+# Read-only probe: checks PIN/PUK retries, slot 0x9D policy (P-256, PIN ALWAYS, On-card) & 0xF9 attestation
 .\familiar-enroll.exe --probe
 
 # Stateless crypto self-test (no registry writes, no Windows password change)
 .\familiar-enroll.exe --card-selftest <PIV-PIN>
+
+# Unblock a locked PIV PIN (SW=6983) using the card PUK (factory default: 12345678) and reset retries to 3
+.\familiar-enroll.exe --unblock-pin <PUK> <NEW-PIN>
+
+# Change the card PUK (replace factory default 12345678 with your own 6-8 char PUK)
+.\familiar-enroll.exe --change-puk <CURRENT-PUK> <NEW-PUK>
 
 # Re-pin the connected card's 0xF9 attestation root in HKLM (Admin; run after `rsk otp burn` or card replacement)
 .\familiar-enroll.exe --repin-attestation

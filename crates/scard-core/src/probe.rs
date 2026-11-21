@@ -6,8 +6,8 @@ use crate::attestation::verify_slot_attestation;
 use crate::error::{AuthError, Result};
 use crate::pcsc::{ScardContext, SCARD_LEAVE_CARD};
 use crate::piv::{
-    validate_slot_9d_policy, PivSession, SlotPolicy, SLOT_CARD_AUTH, SLOT_DIGITAL_SIGNATURE,
-    SLOT_KEY_MANAGEMENT, SLOT_PIV_AUTH,
+    validate_slot_9d_policy, PinPukMetadata, PivSession, SlotPolicy, KEY_REF_PIN, KEY_REF_PUK,
+    SLOT_CARD_AUTH, SLOT_DIGITAL_SIGNATURE, SLOT_KEY_MANAGEMENT, SLOT_PIV_AUTH,
 };
 
 #[derive(Debug, Clone)]
@@ -27,6 +27,8 @@ pub struct ReaderProbe {
     pub piv_selected: bool,
     pub card_name: Option<String>,
     pub algorithms: Vec<u8>,
+    pub pin_metadata: Option<PinPukMetadata>,
+    pub puk_metadata: Option<PinPukMetadata>,
     pub slots: Vec<SlotProbe>,
     pub f9_fingerprint_hex: Option<String>,
     pub attestation_verified: bool,
@@ -50,6 +52,8 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>> {
             piv_selected: false,
             card_name: None,
             algorithms: Vec::new(),
+            pin_metadata: None,
+            puk_metadata: None,
             slots: Vec::new(),
             f9_fingerprint_hex: None,
             attestation_verified: false,
@@ -72,6 +76,10 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>> {
                         info.piv_selected = true;
                         info.card_name = selected.card_name;
                         info.algorithms = selected.algorithms;
+                        info.pin_metadata =
+                            session.get_pin_puk_metadata(KEY_REF_PIN).ok().flatten();
+                        info.puk_metadata =
+                            session.get_pin_puk_metadata(KEY_REF_PUK).ok().flatten();
 
                         let mut pub_9d: Option<Vec<u8>> = None;
 

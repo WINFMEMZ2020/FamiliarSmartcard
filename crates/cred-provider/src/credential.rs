@@ -1,5 +1,6 @@
 //! Credential object: bound-user and explicit ("Other user") tiles, PIN/username
-//! fields, isolated helper invocation, and `GetSerialization`.
+//! fields, in-place PUK PIN-unblock workflow, isolated helper invocation, and
+//! `GetSerialization`.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -17,13 +18,14 @@ use windows::Win32::System::Com::{CoTaskMemAlloc, CoTaskMemFree};
 use windows::Win32::UI::Shell::{
     ICredentialProviderCredential, ICredentialProviderCredentialEvents,
     ICredentialProviderCredential_Impl, ICredentialProviderCredential_Vtbl, CPFIS_FOCUSED,
-    CPFIS_NONE, CPFS_DISPLAY_IN_BOTH, CPFS_DISPLAY_IN_SELECTED_TILE, CPFS_HIDDEN, CPFT_EDIT_TEXT,
-    CPFT_LARGE_TEXT, CPFT_PASSWORD_TEXT, CPFT_SMALL_TEXT, CPFT_SUBMIT_BUTTON, CPFT_TILE_IMAGE,
-    CPGSR_NO_CREDENTIAL_NOT_FINISHED, CPGSR_RETURN_CREDENTIAL_FINISHED, CPSI_ERROR, CPSI_NONE,
-    CPSI_WARNING, CREDENTIAL_PROVIDER_CREDENTIAL_SERIALIZATION,
-    CREDENTIAL_PROVIDER_FIELD_DESCRIPTOR, CREDENTIAL_PROVIDER_FIELD_INTERACTIVE_STATE,
-    CREDENTIAL_PROVIDER_FIELD_STATE, CREDENTIAL_PROVIDER_GET_SERIALIZATION_RESPONSE,
-    CREDENTIAL_PROVIDER_STATUS_ICON, CREDENTIAL_PROVIDER_USAGE_SCENARIO,
+    CPFIS_NONE, CPFS_DISPLAY_IN_BOTH, CPFS_DISPLAY_IN_SELECTED_TILE, CPFS_HIDDEN,
+    CPFT_COMMAND_LINK, CPFT_EDIT_TEXT, CPFT_LARGE_TEXT, CPFT_PASSWORD_TEXT, CPFT_SMALL_TEXT,
+    CPFT_SUBMIT_BUTTON, CPFT_TILE_IMAGE, CPGSR_NO_CREDENTIAL_NOT_FINISHED,
+    CPGSR_RETURN_CREDENTIAL_FINISHED, CPSI_ERROR, CPSI_NONE, CPSI_WARNING,
+    CREDENTIAL_PROVIDER_CREDENTIAL_SERIALIZATION, CREDENTIAL_PROVIDER_FIELD_DESCRIPTOR,
+    CREDENTIAL_PROVIDER_FIELD_INTERACTIVE_STATE, CREDENTIAL_PROVIDER_FIELD_STATE,
+    CREDENTIAL_PROVIDER_GET_SERIALIZATION_RESPONSE, CREDENTIAL_PROVIDER_STATUS_ICON,
+    CREDENTIAL_PROVIDER_USAGE_SCENARIO,
 };
 use zeroize::Zeroizing;
 
@@ -43,16 +45,28 @@ use crate::helper_client::{
     invoke_auth_helper, DEFAULT_HELPER_TIMEOUT_MS, TOUCH_HELPER_TIMEOUT_MS,
 };
 use crate::kerb::{negotiate_package, pack_kerb, protect_password};
-use scard_core::ipc::{HelperIcon, HelperRequest, HelperResponse};
+use scard_core::crypto::constant_time_eq;
+use scard_core::ipc::{
+    HelperFailureReason, HelperIcon, HelperOperation, HelperRequest, HelperResponse,
+};
 use scard_core::piv::{TOUCH_POLICY_ALWAYS, TOUCH_POLICY_CACHED};
 
 const SFI_TILEIMAGE: u32 = 0;
 const SFI_LABEL: u32 = 1;
 const SFI_USERNAME: u32 = 2;
 const SFI_PIN: u32 = 3;
-const SFI_SUBMIT: u32 = 4;
-const SFI_STATUS: u32 = 5;
-const FIELD_COUNT: u32 = 6;
+const SFI_PUK: u32 = 4;
+const SFI_NEW_PIN: u32 = 5;
+const SFI_CONFIRM_PIN: u32 = 6;
+const SFI_SUBMIT: u32 = 7;
+const SFI_STATUS: u32 = 8;
+const SFI_TOGGLE_MODE: u32 = 9;
+const FIELD_COUNT: u32 = 10;
+
+const LABEL_NORMAL: &str = "Sign in with RS-Key";
+const LABEL_UNBLOCK: &str = "Unblock RS-Key with PUK";
+const LINK_TO_UNBLOCK: &str = "PIN blocked? Unblock with PUK";
+const LINK_TO_NORMAL: &str = "Back to normal PIN sign-in";
 
 #[derive(Clone)]
 enum TargetMode {
@@ -69,8 +83,34 @@ enum TargetMode {
 struct CredentialMutable {
     typed_username: String,
     pin: Zeroizing<String>,
+    puk: Zeroizing<String>,
+    new_pin: Zeroizing<String>,
+    confirm_pin: Zeroizing<String>,
+    unblock_mode: bool,
     status: String,
     events: Option<ICredentialProviderCredentialEvents>,
+}
+
+impl CredentialMutable {
+    fn new() -> Self {
+        Self {
+            typed_username: String::new(),
+            pin: Zeroizing::new(String::new()),
+            puk: Zeroizing::new(String::new()),
+            new_pin: Zeroizing::new(String::new()),
+            confirm_pin: Zeroizing::new(String::new()),
+            unblock_mode: false,
+            status: String::new(),
+            events: None,
+        }
+    }
+
+    fn clear_secrets(&mut self) {
+        self.pin.clear();
+        self.puk.clear();
+        self.new_pin.clear();
+        self.confirm_pin.clear();
+    }
 }
 
 #[implement(ICredentialProviderCredential, IRawCredentialProviderCredential2)]
@@ -94,12 +134,7 @@ impl Credential {
                 username,
             },
             cpus,
-            inner: Mutex::new(CredentialMutable {
-                typed_username: String::new(),
-                pin: Zeroizing::new(String::new()),
-                status: String::new(),
-                events: None,
-            }),
+            inner: Mutex::new(CredentialMutable::new()),
         }
     }
 
@@ -107,12 +142,7 @@ impl Credential {
         Self {
             mode: TargetMode::ExplicitUser,
             cpus,
-            inner: Mutex::new(CredentialMutable {
-                typed_username: String::new(),
-                pin: Zeroizing::new(String::new()),
-                status: String::new(),
-                events: None,
-            }),
+            inner: Mutex::new(CredentialMutable::new()),
         }
     }
 
@@ -126,43 +156,102 @@ impl Credential {
         matches!(self.mode, TargetMode::ExplicitUser)
     }
 
-    fn clear_pin_memory(&self) {
-        let mut guard = self.lock_inner();
-        guard.pin.clear();
+    fn clear_secret_memory(&self) {
+        self.lock_inner().clear_secrets();
     }
 
     fn set_status(&self, text: String) {
-        let mut guard = self.lock_inner();
-        guard.status = text;
-    }
-
-    fn status_text(&self) -> String {
-        self.lock_inner().status.clone()
+        self.lock_inner().status = text;
     }
 }
 
 impl Drop for Credential {
     fn drop(&mut self) {
-        self.clear_pin_memory();
+        self.clear_secret_memory();
     }
 }
 
 impl Credential_Impl {
-    /// Zeroize the internal PIN buffer AND notify `LogonUI.exe` via
-    /// `ICredentialProviderCredentialEvents::SetFieldString` so the visual
-    /// password box on the lock screen never retains stale `••••••` dots.
-    fn clear_pin_and_notify_ui(&self) {
+    /// Zeroize all internal PIN/PUK buffers AND notify `LogonUI.exe` via
+    /// `ICredentialProviderCredentialEvents::SetFieldString` so no password box
+    /// on the lock screen ever retains stale `••••••` dots.
+    fn clear_secrets_and_notify_ui(&self) {
         let events_opt = {
             let mut guard = self.lock_inner();
-            guard.pin.clear();
+            guard.clear_secrets();
             guard.events.clone()
         };
         if let Some(events) = events_opt {
             let this_cpc: ICredentialProviderCredential = self.to_interface();
-            // SAFETY: Invoked outside `self.inner` Mutex so any synchronous callback
-            // from `LogonUI.exe` into `GetStringValue(SFI_PIN)` cannot deadlock.
+            // SAFETY: Invoked outside `self.inner` Mutex so synchronous callbacks cannot deadlock.
             unsafe {
-                let _ = events.SetFieldString(&this_cpc, SFI_PIN, w!(""));
+                for field in [SFI_PIN, SFI_PUK, SFI_NEW_PIN, SFI_CONFIRM_PIN] {
+                    let _ = events.SetFieldString(&this_cpc, field, w!(""));
+                }
+            }
+        }
+    }
+
+    /// Switch between normal PIN sign-in and in-place PUK PIN-unblock mode,
+    /// updating field visibility, labels, submit button adjacency, and focus.
+    fn set_unblock_mode_and_notify_ui(&self, unblock: bool) {
+        let (events_opt, needs_username) = {
+            let mut guard = self.lock_inner();
+            guard.unblock_mode = unblock;
+            guard.clear_secrets();
+            let needs_user = self.is_explicit_user() && guard.typed_username.is_empty();
+            (guard.events.clone(), needs_user)
+        };
+
+        if let Some(events) = events_opt {
+            let this_cpc: ICredentialProviderCredential = self.to_interface();
+            let (pin_state, puk_state, submit_adj, label, toggle_label) = if unblock {
+                (
+                    CPFS_HIDDEN,
+                    CPFS_DISPLAY_IN_SELECTED_TILE,
+                    SFI_CONFIRM_PIN,
+                    w!("Unblock RS-Key with PUK"),
+                    w!("Back to normal PIN sign-in"),
+                )
+            } else {
+                (
+                    CPFS_DISPLAY_IN_SELECTED_TILE,
+                    CPFS_HIDDEN,
+                    SFI_PIN,
+                    w!("Sign in with RS-Key"),
+                    w!("PIN blocked? Unblock with PUK"),
+                )
+            };
+
+            // SAFETY: Invoked outside `self.inner` Mutex.
+            unsafe {
+                for field in [SFI_PIN, SFI_PUK, SFI_NEW_PIN, SFI_CONFIRM_PIN] {
+                    let _ = events.SetFieldString(&this_cpc, field, w!(""));
+                }
+                let _ = events.SetFieldString(&this_cpc, SFI_LABEL, label);
+                let _ = events.SetFieldString(&this_cpc, SFI_TOGGLE_MODE, toggle_label);
+                let _ = events.SetFieldState(&this_cpc, SFI_PIN, pin_state);
+                let _ = events.SetFieldState(&this_cpc, SFI_PUK, puk_state);
+                let _ = events.SetFieldState(&this_cpc, SFI_NEW_PIN, puk_state);
+                let _ = events.SetFieldState(&this_cpc, SFI_CONFIRM_PIN, puk_state);
+                let _ = events.SetFieldSubmitButton(&this_cpc, SFI_SUBMIT, submit_adj);
+
+                let _ = events.SetFieldInteractiveState(&this_cpc, SFI_PIN, CPFIS_NONE);
+                let _ = events.SetFieldInteractiveState(&this_cpc, SFI_PUK, CPFIS_NONE);
+                let _ = events.SetFieldInteractiveState(&this_cpc, SFI_NEW_PIN, CPFIS_NONE);
+                let _ = events.SetFieldInteractiveState(&this_cpc, SFI_CONFIRM_PIN, CPFIS_NONE);
+                if self.is_explicit_user() {
+                    let _ = events.SetFieldInteractiveState(&this_cpc, SFI_USERNAME, CPFIS_NONE);
+                }
+
+                let focus_field = if needs_username {
+                    SFI_USERNAME
+                } else if unblock {
+                    SFI_PUK
+                } else {
+                    SFI_PIN
+                };
+                let _ = events.SetFieldInteractiveState(&this_cpc, focus_field, CPFIS_FOCUSED);
             }
         }
     }
@@ -182,7 +271,58 @@ impl Credential_Impl {
                 *pcpsi = icon;
             }
         }
-        self.clear_pin_and_notify_ui();
+        self.clear_secrets_and_notify_ui();
+    }
+
+    fn resolve_target_account(
+        &self,
+        typed_username: &str,
+        ppsz_status: *mut PWSTR,
+        pcpsi: *mut CREDENTIAL_PROVIDER_STATUS_ICON,
+    ) -> Option<(String, String, String)> {
+        match &self.mode {
+            TargetMode::BoundUser {
+                sid,
+                domain,
+                username,
+            } => Some((sid.clone(), domain.clone(), username.clone())),
+            TargetMode::ExplicitUser => {
+                if typed_username.is_empty() {
+                    // SAFETY: Out-pointers verified non-null by `GetSerialization`.
+                    unsafe {
+                        self.fail(
+                            ppsz_status,
+                            pcpsi,
+                            "Enter your local Windows username.".into(),
+                            CPSI_WARNING,
+                        );
+                    }
+                    return None;
+                }
+
+                // Uniform error message + small floor delay prevent local username enumeration
+                // when RDP is exposed without NLA.
+                match scard_core::account::lookup_local_account_by_name(typed_username) {
+                    Ok(info) if scard_core::storage::vault_exists(&info.sid) => {
+                        Some((info.sid, info.domain, info.username))
+                    }
+                    _ => {
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        // SAFETY: Out-pointers verified non-null by `GetSerialization`.
+                        unsafe {
+                            self.fail(
+                                ppsz_status,
+                                pcpsi,
+                                "Sign-in failed. Verify the local username, RS-Key enrollment, and credentials."
+                                    .into(),
+                                CPSI_ERROR,
+                            );
+                        }
+                        None
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -203,9 +343,9 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
 
     fn SetSelected(&self) -> WinResult<BOOL> {
         guard_com(|| {
-            // Clear any leftover PIN visually whenever the tile is (re-)selected
-            // (for example, after dismissing an error screen with OK).
-            self.clear_pin_and_notify_ui();
+            // Clear leftover secret text while preserving `unblock_mode` (so returning
+            // from a `PinBlocked` error screen keeps the PUK unblock fields open!).
+            self.clear_secrets_and_notify_ui();
             // Never auto-logon.
             Ok(BOOL(0))
         })
@@ -213,7 +353,7 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
 
     fn SetDeselected(&self) -> WinResult<()> {
         guard_com(|| {
-            self.clear_pin_and_notify_ui();
+            self.set_unblock_mode_and_notify_ui(false);
             Ok(())
         })
     }
@@ -234,13 +374,22 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
         }
 
         guard_com(|| {
-            let explicit_needs_username =
-                self.is_explicit_user() && self.lock_inner().typed_username.is_empty();
+            let (unblock_mode, explicit_needs_username, status_empty) = {
+                let guard = self.lock_inner();
+                (
+                    guard.unblock_mode,
+                    self.is_explicit_user() && guard.typed_username.is_empty(),
+                    guard.status.is_empty(),
+                )
+            };
+
             let (state, interactive) = match dwfieldid {
                 // `CPFS_DISPLAY_IN_BOTH` is required by Windows 10/11 XAML LogonUI so the
                 // "Sign-in options" icon bar renders our credential switch button!
                 SFI_TILEIMAGE => (CPFS_DISPLAY_IN_BOTH, CPFIS_NONE),
-                SFI_LABEL | SFI_SUBMIT => (CPFS_DISPLAY_IN_SELECTED_TILE, CPFIS_NONE),
+                SFI_LABEL | SFI_SUBMIT | SFI_TOGGLE_MODE => {
+                    (CPFS_DISPLAY_IN_SELECTED_TILE, CPFIS_NONE)
+                }
                 SFI_USERNAME => {
                     if self.is_explicit_user() {
                         let focus = if explicit_needs_username {
@@ -254,15 +403,38 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
                     }
                 }
                 SFI_PIN => {
-                    let focus = if explicit_needs_username {
-                        CPFIS_NONE
+                    if unblock_mode {
+                        (CPFS_HIDDEN, CPFIS_NONE)
                     } else {
-                        CPFIS_FOCUSED
-                    };
-                    (CPFS_DISPLAY_IN_SELECTED_TILE, focus)
+                        let focus = if explicit_needs_username {
+                            CPFIS_NONE
+                        } else {
+                            CPFIS_FOCUSED
+                        };
+                        (CPFS_DISPLAY_IN_SELECTED_TILE, focus)
+                    }
+                }
+                SFI_PUK => {
+                    if unblock_mode {
+                        let focus = if explicit_needs_username {
+                            CPFIS_NONE
+                        } else {
+                            CPFIS_FOCUSED
+                        };
+                        (CPFS_DISPLAY_IN_SELECTED_TILE, focus)
+                    } else {
+                        (CPFS_HIDDEN, CPFIS_NONE)
+                    }
+                }
+                SFI_NEW_PIN | SFI_CONFIRM_PIN => {
+                    if unblock_mode {
+                        (CPFS_DISPLAY_IN_SELECTED_TILE, CPFIS_NONE)
+                    } else {
+                        (CPFS_HIDDEN, CPFIS_NONE)
+                    }
                 }
                 SFI_STATUS => {
-                    if self.status_text().is_empty() {
+                    if status_empty {
                         (CPFS_HIDDEN, CPFIS_NONE)
                     } else {
                         (CPFS_DISPLAY_IN_SELECTED_TILE, CPFIS_NONE)
@@ -281,19 +453,28 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
     }
 
     fn GetStringValue(&self, dwfieldid: u32) -> WinResult<PWSTR> {
-        guard_com(|| match dwfieldid {
-            SFI_LABEL => alloc_pwstr("Sign in with RS-Key"),
-            SFI_USERNAME => {
-                let guard = self.lock_inner();
-                alloc_pwstr(&guard.typed_username)
+        guard_com(|| {
+            let guard = self.lock_inner();
+            match dwfieldid {
+                SFI_LABEL => alloc_pwstr(if guard.unblock_mode {
+                    LABEL_UNBLOCK
+                } else {
+                    LABEL_NORMAL
+                }),
+                SFI_USERNAME => alloc_pwstr(&guard.typed_username),
+                SFI_PIN => alloc_pwstr(guard.pin.as_str()),
+                SFI_PUK => alloc_pwstr(guard.puk.as_str()),
+                SFI_NEW_PIN => alloc_pwstr(guard.new_pin.as_str()),
+                SFI_CONFIRM_PIN => alloc_pwstr(guard.confirm_pin.as_str()),
+                SFI_SUBMIT => alloc_pwstr("Sign in"),
+                SFI_STATUS => alloc_pwstr(&guard.status),
+                SFI_TOGGLE_MODE => alloc_pwstr(if guard.unblock_mode {
+                    LINK_TO_NORMAL
+                } else {
+                    LINK_TO_UNBLOCK
+                }),
+                _ => Err(E_NOTIMPL.into()),
             }
-            SFI_PIN => {
-                let guard = self.lock_inner();
-                alloc_pwstr(guard.pin.as_str())
-            }
-            SFI_SUBMIT => alloc_pwstr("Sign in"),
-            SFI_STATUS => alloc_pwstr(&self.status_text()),
-            _ => Err(E_NOTIMPL.into()),
         })
     }
 
@@ -317,7 +498,8 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
 
     fn GetSubmitButtonValue(&self, dwfieldid: u32) -> WinResult<u32> {
         if dwfieldid == SFI_SUBMIT {
-            Ok(SFI_PIN)
+            let unblock = self.lock_inner().unblock_mode;
+            Ok(if unblock { SFI_CONFIRM_PIN } else { SFI_PIN })
         } else {
             Err(E_NOTIMPL.into())
         }
@@ -351,17 +533,23 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
                 self.lock_inner().typed_username = raw.trim().to_string();
                 Ok(())
             }
-            SFI_PIN => {
+            SFI_PIN | SFI_PUK | SFI_NEW_PIN | SFI_CONFIRM_PIN => {
                 // SAFETY: `psz` was checked non-null; copy directly into a `Zeroizing` string.
                 let raw = Zeroizing::new(unsafe { psz.to_string() }.unwrap_or_default());
                 let trimmed = raw.trim();
                 if trimmed.len() > 16 {
-                    self.set_status("PIN is too long.".into());
+                    self.set_status("PIN / PUK input is too long.".into());
                     return Ok(());
                 }
                 let mut guard = self.lock_inner();
-                guard.pin.clear();
-                guard.pin.push_str(trimmed);
+                let target = match dwfieldid {
+                    SFI_PIN => &mut guard.pin,
+                    SFI_PUK => &mut guard.puk,
+                    SFI_NEW_PIN => &mut guard.new_pin,
+                    _ => &mut guard.confirm_pin,
+                };
+                target.clear();
+                target.push_str(trimmed);
                 Ok(())
             }
             _ => Err(E_NOTIMPL.into()),
@@ -376,8 +564,15 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
         Err(E_NOTIMPL.into())
     }
 
-    fn CommandLinkClicked(&self, _dwfieldid: u32) -> WinResult<()> {
-        Err(E_NOTIMPL.into())
+    fn CommandLinkClicked(&self, dwfieldid: u32) -> WinResult<()> {
+        if dwfieldid != SFI_TOGGLE_MODE {
+            return Err(E_NOTIMPL.into());
+        }
+        guard_com(|| {
+            let next_mode = !self.lock_inner().unblock_mode;
+            self.set_unblock_mode_and_notify_ui(next_mode);
+            Ok(())
+        })
     }
 
     fn GetSerialization(
@@ -399,86 +594,114 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
         }
 
         guard_com(|| {
-            let (typed_username, pin_bytes) = {
+            let (unblock_mode, typed_username, pin_bytes, puk_bytes, new_pin_bytes, confirm_bytes) = {
                 let guard = self.lock_inner();
                 (
+                    guard.unblock_mode,
                     guard.typed_username.clone(),
                     Zeroizing::new(guard.pin.as_bytes().to_vec()),
+                    Zeroizing::new(guard.puk.as_bytes().to_vec()),
+                    Zeroizing::new(guard.new_pin.as_bytes().to_vec()),
+                    Zeroizing::new(guard.confirm_pin.as_bytes().to_vec()),
                 )
             };
 
-            if pin_bytes.is_empty() {
-                // SAFETY: Verified non-null above.
-                unsafe {
-                    self.fail(
-                        ppsz_status,
-                        pcpsi,
-                        "Enter your RS-Key PIN.".into(),
-                        CPSI_WARNING,
-                    );
+            let operation = if unblock_mode {
+                if puk_bytes.is_empty() {
+                    // SAFETY: Verified non-null above.
+                    unsafe {
+                        self.fail(
+                            ppsz_status,
+                            pcpsi,
+                            "Enter your RS-Key PUK (6-8 characters; factory default is 12345678)."
+                                .into(),
+                            CPSI_WARNING,
+                        );
+                    }
+                    return Ok(());
                 }
-                return Ok(());
-            }
-            if pin_bytes.len() < 6
-                || pin_bytes.len() > 8
-                || !pin_bytes.iter().all(|b| b.is_ascii_digit())
-            {
-                // SAFETY: Verified non-null above.
-                unsafe {
-                    self.fail(
-                        ppsz_status,
-                        pcpsi,
-                        "PIV PIN must be 6-8 digits.".into(),
-                        CPSI_WARNING,
-                    );
+                if puk_bytes.len() < 6
+                    || puk_bytes.len() > 8
+                    || !puk_bytes.iter().all(|&b| (0x21..=0x7E).contains(&b))
+                {
+                    // SAFETY: Verified non-null above.
+                    unsafe {
+                        self.fail(
+                            ppsz_status,
+                            pcpsi,
+                            "RS-Key PUK must be 6-8 printable ASCII characters.".into(),
+                            CPSI_WARNING,
+                        );
+                    }
+                    return Ok(());
                 }
-                return Ok(());
-            }
+                if new_pin_bytes.len() < 6
+                    || new_pin_bytes.len() > 8
+                    || !new_pin_bytes.iter().all(|b| b.is_ascii_digit())
+                {
+                    // SAFETY: Verified non-null above.
+                    unsafe {
+                        self.fail(
+                            ppsz_status,
+                            pcpsi,
+                            "New PIV PIN must be 6-8 ASCII digits.".into(),
+                            CPSI_WARNING,
+                        );
+                    }
+                    return Ok(());
+                }
+                if !constant_time_eq(&new_pin_bytes, &confirm_bytes) {
+                    // SAFETY: Verified non-null above.
+                    unsafe {
+                        self.fail(
+                            ppsz_status,
+                            pcpsi,
+                            "New PIN and confirmation PIN do not match.".into(),
+                            CPSI_WARNING,
+                        );
+                    }
+                    return Ok(());
+                }
+                HelperOperation::UnblockAndUnlock {
+                    puk: puk_bytes,
+                    new_pin: new_pin_bytes,
+                }
+            } else {
+                if pin_bytes.is_empty() {
+                    // SAFETY: Verified non-null above.
+                    unsafe {
+                        self.fail(
+                            ppsz_status,
+                            pcpsi,
+                            "Enter your RS-Key PIN.".into(),
+                            CPSI_WARNING,
+                        );
+                    }
+                    return Ok(());
+                }
+                if pin_bytes.len() < 6
+                    || pin_bytes.len() > 8
+                    || !pin_bytes.iter().all(|b| b.is_ascii_digit())
+                {
+                    // SAFETY: Verified non-null above.
+                    unsafe {
+                        self.fail(
+                            ppsz_status,
+                            pcpsi,
+                            "PIV PIN must be 6-8 digits.".into(),
+                            CPSI_WARNING,
+                        );
+                    }
+                    return Ok(());
+                }
+                HelperOperation::Unlock { pin: pin_bytes }
+            };
 
             let computer = scard_core::account::computer_name().unwrap_or_else(|_| ".".into());
-
-            let (sid, domain, username) = match &self.mode {
-                TargetMode::BoundUser {
-                    sid,
-                    domain,
-                    username,
-                } => (sid.clone(), domain.clone(), username.clone()),
-                TargetMode::ExplicitUser => {
-                    if typed_username.is_empty() {
-                        // SAFETY: Verified non-null above.
-                        unsafe {
-                            self.fail(
-                                ppsz_status,
-                                pcpsi,
-                                "Enter your local Windows username.".into(),
-                                CPSI_WARNING,
-                            );
-                        }
-                        return Ok(());
-                    }
-
-                    // Uniform error message + small floor delay prevent local username enumeration
-                    // when RDP is exposed without NLA.
-                    match scard_core::account::lookup_local_account_by_name(&typed_username) {
-                        Ok(info) if scard_core::storage::vault_exists(&info.sid) => {
-                            (info.sid, info.domain, info.username)
-                        }
-                        _ => {
-                            std::thread::sleep(std::time::Duration::from_millis(150));
-                            // SAFETY: Verified non-null above.
-                            unsafe {
-                                self.fail(
-                                    ppsz_status,
-                                    pcpsi,
-                                    "Sign-in failed. Verify the local username, RS-Key enrollment, and PIN."
-                                        .into(),
-                                    CPSI_ERROR,
-                                );
-                            }
-                            return Ok(());
-                        }
-                    }
-                }
+            let Some((sid, domain, username)) =
+                self.resolve_target_account(&typed_username, ppsz_status, pcpsi)
+            else {
+                return Ok(());
             };
 
             let timeout_ms = match scard_core::storage::read_touch_policy(&sid) {
@@ -490,12 +713,16 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
                 sid,
                 username: username.clone(),
                 computer,
-                pin: pin_bytes,
+                operation,
             };
 
             let password = match invoke_auth_helper(&req, timeout_ms) {
                 HelperResponse::Success { password } => password,
-                HelperResponse::Failure { icon, message } => {
+                HelperResponse::Failure {
+                    reason,
+                    icon,
+                    message,
+                } => {
                     let cp_icon = match icon {
                         HelperIcon::None => CPSI_NONE,
                         HelperIcon::Warning => CPSI_WARNING,
@@ -504,6 +731,11 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
                     // SAFETY: Verified non-null above.
                     unsafe {
                         self.fail(ppsz_status, pcpsi, message, cp_icon);
+                    }
+                    // Automatically expand the PUK unblock fields when the card reports
+                    // 0 PIN attempts left so returning from OK lets the user unblock immediately!
+                    if reason == HelperFailureReason::PinBlocked {
+                        self.set_unblock_mode_and_notify_ui(true);
                     }
                     return Ok(());
                 }
@@ -567,7 +799,7 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
                 *pcpgsr = CPGSR_RETURN_CREDENTIAL_FINISHED;
             }
             self.set_status("Signing in...".into());
-            self.clear_pin_and_notify_ui();
+            self.set_unblock_mode_and_notify_ui(false);
             Ok(())
         })
     }
@@ -652,11 +884,15 @@ impl IRawCredentialProviderCredential2_Impl for Credential_Impl {
 pub fn field_descriptor(index: u32) -> WinResult<CREDENTIAL_PROVIDER_FIELD_DESCRIPTOR> {
     let (label, cpft) = match index {
         SFI_TILEIMAGE => ("RS-Key", CPFT_TILE_IMAGE),
-        SFI_LABEL => ("Sign in with RS-Key", CPFT_LARGE_TEXT),
+        SFI_LABEL => (LABEL_NORMAL, CPFT_LARGE_TEXT),
         SFI_USERNAME => ("Username", CPFT_EDIT_TEXT),
         SFI_PIN => ("RS-Key PIN", CPFT_PASSWORD_TEXT),
+        SFI_PUK => ("RS-Key PUK (default: 12345678)", CPFT_PASSWORD_TEXT),
+        SFI_NEW_PIN => ("New PIN (6-8 digits)", CPFT_PASSWORD_TEXT),
+        SFI_CONFIRM_PIN => ("Confirm new PIN", CPFT_PASSWORD_TEXT),
         SFI_SUBMIT => ("Sign in", CPFT_SUBMIT_BUTTON),
         SFI_STATUS => ("Status", CPFT_SMALL_TEXT),
+        SFI_TOGGLE_MODE => (LINK_TO_UNBLOCK, CPFT_COMMAND_LINK),
         _ => return Err(E_INVALIDARG.into()),
     };
 
@@ -711,7 +947,6 @@ fn create_rskey_tile_bitmap() -> WinResult<HBITMAP> {
     for y in 0..H {
         for x in 0..W {
             let mut color = 0x0000_0000u32;
-            // Card body: x in 4..44, y in 10..38
             if (4..44).contains(&x) && (10..38).contains(&y) {
                 color = if x == 4 || x == 43 || y == 10 || y == 37 {
                     BORDER
@@ -719,11 +954,9 @@ fn create_rskey_tile_bitmap() -> WinResult<HBITMAP> {
                     BG_DARK
                 };
             }
-            // Gold smart-card chip: x in 9..19, y in 18..28
             if (9..19).contains(&x) && (18..28).contains(&y) {
                 color = GOLD;
             }
-            // Key ring & shaft on right half of card
             let dx = x as isize - 26;
             let dy = y as isize - 24;
             let dist2 = dx * dx + dy * dy;
@@ -768,7 +1001,6 @@ mod tests {
     #[test]
     fn explicit_user_credential_returns_s_false_and_null_sid_over_com_vtable() {
         let base: ICredentialProviderCredential = Credential::new_explicit_user(CPUS_LOGON).into();
-        // Cast to official Windows `ICredentialProviderCredential2` to verify exact IID & vtable ABI!
         let cred: ICredentialProviderCredential2 = base.cast().unwrap();
         let mut raw_sid = PWSTR(std::ptr::dangling_mut());
         // SAFETY: Direct vtable call mirrors exact `LogonUI.exe` invocation.
@@ -776,7 +1008,6 @@ mod tests {
         assert_eq!(hr, S_FALSE);
         assert!(raw_sid.is_null());
 
-        // Null out-pointer must return `E_INVALIDARG`.
         // SAFETY: Testing null out-pointer defense.
         let null_hr =
             unsafe { (Interface::vtable(&cred).GetUserSid)(cred.as_raw(), std::ptr::null_mut()) };
@@ -819,8 +1050,6 @@ mod tests {
             assert_eq!(state, CPFS_DISPLAY_IN_SELECTED_TILE);
             assert_eq!(inter, CPFIS_FOCUSED);
 
-            // Tile image must be CPFS_DISPLAY_IN_BOTH with a valid HBITMAP so Windows 10/11
-            // renders the "Sign-in options" icon bar on both user tiles and "Other user"!
             cred.GetFieldState(SFI_TILEIMAGE, &mut state, &mut inter)
                 .unwrap();
             assert_eq!(state, CPFS_DISPLAY_IN_BOTH);
@@ -845,6 +1074,8 @@ mod tests {
     #[implement(ICredentialProviderCredentialEvents)]
     struct MockCredentialEvents {
         string_updates: std::sync::Arc<Mutex<Vec<(u32, String)>>>,
+        state_updates: std::sync::Arc<Mutex<Vec<(u32, CREDENTIAL_PROVIDER_FIELD_STATE)>>>,
+        submit_adj: std::sync::Arc<Mutex<Option<u32>>>,
     }
 
     impl windows::Win32::UI::Shell::ICredentialProviderCredentialEvents_Impl
@@ -853,9 +1084,10 @@ mod tests {
         fn SetFieldState(
             &self,
             _pcpc: Ref<'_, ICredentialProviderCredential>,
-            _dwfieldid: u32,
-            _cpfs: CREDENTIAL_PROVIDER_FIELD_STATE,
+            dwfieldid: u32,
+            cpfs: CREDENTIAL_PROVIDER_FIELD_STATE,
         ) -> WinResult<()> {
+            self.state_updates.lock().unwrap().push((dwfieldid, cpfs));
             Ok(())
         }
 
@@ -934,8 +1166,9 @@ mod tests {
             &self,
             _pcpc: Ref<'_, ICredentialProviderCredential>,
             _dwfieldid: u32,
-            _dwadjacentto: u32,
+            dwadjacentto: u32,
         ) -> WinResult<()> {
+            *self.submit_adj.lock().unwrap() = Some(dwadjacentto);
             Ok(())
         }
 
@@ -945,10 +1178,14 @@ mod tests {
     }
 
     #[test]
-    fn failed_login_and_reselection_clear_pin_via_set_field_string_event() {
+    fn failed_login_reselection_and_puk_unblock_toggle_notify_logonui_events() {
         let updates = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let state_updates = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let submit_adj = std::sync::Arc::new(Mutex::new(None));
         let events: ICredentialProviderCredentialEvents = MockCredentialEvents {
             string_updates: updates.clone(),
+            state_updates: state_updates.clone(),
+            submit_adj: submit_adj.clone(),
         }
         .into();
 
@@ -957,8 +1194,6 @@ mod tests {
         unsafe {
             cred.Advise(&events).unwrap();
 
-            // Simulate user typing username + PIN, then failing sign-in (e.g., non-existent/unbound user
-            // or missing card).
             cred.SetStringValue(SFI_USERNAME, w!("__nonexistent_fsc_test_user__"))
                 .unwrap();
             cred.SetStringValue(SFI_PIN, w!("123456")).unwrap();
@@ -974,25 +1209,50 @@ mod tests {
                 CoTaskMemFree(Some(status_pwstr.0 as *const c_void));
             }
 
-            // Internal PIN buffer must be empty AND LogonUI must have received SetFieldString(SFI_PIN, "").
             let pin_after = cred.GetStringValue(SFI_PIN).unwrap();
             assert_eq!(pin_after.to_string().unwrap(), "");
             CoTaskMemFree(Some(pin_after.0 as *const c_void));
-            assert_eq!(updates.lock().unwrap().as_slice(), &[(SFI_PIN, "".into())]);
+            assert!(updates.lock().unwrap().contains(&(SFI_PIN, String::new())));
 
-            // Username stays preserved, and focus shifts to PIN so returning from OK lets the user
-            // immediately type their PIN again!
-            let mut state = CPFS_HIDDEN;
-            let mut inter = CPFIS_NONE;
-            cred.GetFieldState(SFI_PIN, &mut state, &mut inter).unwrap();
-            assert_eq!(inter, CPFIS_FOCUSED);
+            // Clicking the CommandLink toggles into PUK Unblock mode and moves Submit to SFI_CONFIRM_PIN!
+            cred.CommandLinkClicked(SFI_TOGGLE_MODE).unwrap();
+            assert_eq!(*submit_adj.lock().unwrap(), Some(SFI_CONFIRM_PIN));
+            assert_eq!(
+                cred.GetSubmitButtonValue(SFI_SUBMIT).unwrap(),
+                SFI_CONFIRM_PIN
+            );
 
-            // Simulate SetSelected on return to tile: must also notify SetFieldString(SFI_PIN, "").
-            updates.lock().unwrap().clear();
-            cred.SetStringValue(SFI_PIN, w!("654321")).unwrap();
-            let auto_logon = cred.SetSelected().unwrap();
-            assert!(!auto_logon.as_bool());
-            assert_eq!(updates.lock().unwrap().as_slice(), &[(SFI_PIN, "".into())]);
+            let mut puk_state = CPFS_HIDDEN;
+            let mut puk_inter = CPFIS_NONE;
+            cred.GetFieldState(SFI_PUK, &mut puk_state, &mut puk_inter)
+                .unwrap();
+            assert_eq!(puk_state, CPFS_DISPLAY_IN_SELECTED_TILE);
+            assert_eq!(puk_inter, CPFIS_FOCUSED);
+
+            // Mismatched New PIN vs Confirm PIN rejects cleanly and clears PUK/PIN boxes while staying in unblock mode!
+            cred.SetStringValue(SFI_PUK, w!("12345678")).unwrap();
+            cred.SetStringValue(SFI_NEW_PIN, w!("654321")).unwrap();
+            cred.SetStringValue(SFI_CONFIRM_PIN, w!("000000")).unwrap();
+            cred.GetSerialization(&mut cpgsr, &mut cpcs, &mut status_pwstr, &mut icon)
+                .unwrap();
+            assert_eq!(cpgsr, CPGSR_NO_CREDENTIAL_NOT_FINISHED);
+            if !status_pwstr.is_null() {
+                CoTaskMemFree(Some(status_pwstr.0 as *const c_void));
+            }
+            let puk_after = cred.GetStringValue(SFI_PUK).unwrap();
+            assert_eq!(puk_after.to_string().unwrap(), "");
+            CoTaskMemFree(Some(puk_after.0 as *const c_void));
+
+            // SetSelected preserves unblock_mode so returning from OK keeps PUK fields visible!
+            let _ = cred.SetSelected().unwrap();
+            assert_eq!(
+                cred.GetSubmitButtonValue(SFI_SUBMIT).unwrap(),
+                SFI_CONFIRM_PIN
+            );
+
+            // Clicking CommandLink again returns to normal PIN mode.
+            cred.CommandLinkClicked(SFI_TOGGLE_MODE).unwrap();
+            assert_eq!(cred.GetSubmitButtonValue(SFI_SUBMIT).unwrap(), SFI_PIN);
 
             cred.UnAdvise().unwrap();
         }

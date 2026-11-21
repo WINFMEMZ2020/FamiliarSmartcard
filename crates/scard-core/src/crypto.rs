@@ -104,6 +104,20 @@ pub fn verify_recovery_tail(full_password: &str, typed_tail: &str) -> bool {
     constant_time_eq(&expected[tail_start..], actual.as_slice())
 }
 
+/// Generate an unbiased 8-digit random PIV PUK (`00000000`..`99999999`).
+pub fn generate_random_puk() -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::with_capacity(8));
+    let mut byte = Zeroizing::new([0u8; 1]);
+    while out.len() < 8 {
+        OsRng.fill_bytes(byte.as_mut());
+        // Reject >= 250 so `byte % 10` has zero modulo bias across 0..=9.
+        if byte[0] < 250 {
+            out.push((b'0' + (byte[0] % 10)) as char);
+        }
+    }
+    out
+}
+
 /// HKDF-SHA256 with a 32-byte output.
 pub fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]>> {
     let hk = Hkdf::<Sha256>::new(Some(salt), ikm);
