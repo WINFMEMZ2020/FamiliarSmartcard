@@ -175,3 +175,37 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>> {
 
     Ok(out)
 }
+
+/// Lightweight read-only session check used before resolving `ExplicitUser` ("Other user")
+/// usernames so unauthenticated callers without a smart card (or with a busy card)
+/// receive the exact same reader/card error regardless of whether a typed username exists.
+pub fn ensure_piv_card_present_in_session() -> Result<()> {
+    let context = ScardContext::new()?;
+    let readers = context.list_readers()?;
+    if readers.is_empty() {
+        return Err(AuthError::NoReader);
+    }
+
+    let mut last_error = None;
+    for reader in readers {
+        let mut card = match context.connect(&reader) {
+            Ok(c) => c,
+            Err(e) => {
+                last_error = Some(e);
+                continue;
+            }
+        };
+        if let Err(e) = card.begin_transaction() {
+            last_error = Some(e);
+            continue;
+        }
+        let ok = PivSession::new(&card).select().is_ok();
+        let _ = card.end_transaction(SCARD_LEAVE_CARD);
+        let _ = card.disconnect(SCARD_LEAVE_CARD);
+        if ok {
+            return Ok(());
+        }
+    }
+
+    Err(last_error.unwrap_or(AuthError::NoCard))
+}

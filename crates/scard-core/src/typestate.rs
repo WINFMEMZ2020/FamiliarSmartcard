@@ -205,6 +205,13 @@ impl<T: ApduTransport> CardConnected<T> {
             .and_then(|m| m.remaining_retries))
     }
 
+    /// Execute an optional Pre-PIN dynamic ECDH challenge against PIV slot `0x9E`
+    /// (`Card Authentication`, `PIN=NEVER`) BEFORE sending `VERIFY PIN`, preventing
+    /// Evil-Maid fake cards from capturing the user's plaintext PIN.
+    pub fn verify_pre_pin_card_auth(&self, expected_9e_pub_sec1: &[u8]) -> Result<()> {
+        crate::enroll::verify_pre_pin_9e_challenge(&self.0.card, expected_9e_pub_sec1)
+    }
+
     /// First VERIFY. Required because the PIV 9D key uses PIN policy ALWAYS.
     /// If this fails (`63 CX`), execution halts immediately so only 1 retry is consumed.
     pub fn verify_pin(self, pin: &Zeroizing<Vec<u8>>) -> Result<PinVerified<T>> {
@@ -420,6 +427,9 @@ mod tests {
     struct SimulatedPivCard {
         secret_key: SecretKey,
         advertised_public_sec1: Vec<u8>,
+        secret_key_9e: Option<SecretKey>,
+        advertised_9e_public_sec1: Option<Vec<u8>>,
+        hide_pin_metadata: bool,
         pin: RefCell<Vec<u8>>,
         puk: Vec<u8>,
         remaining_retries: RefCell<u8>,
@@ -448,6 +458,9 @@ mod tests {
             Self {
                 secret_key,
                 advertised_public_sec1,
+                secret_key_9e: None,
+                advertised_9e_public_sec1: None,
+                hide_pin_metadata: false,
                 pin: RefCell::new(pin.to_vec()),
                 puk: puk.to_vec(),
                 remaining_retries: RefCell::new(3),
@@ -468,12 +481,31 @@ mod tests {
                 (0x00, 0xA4) => Ok(vec![
                     0x50, 0x07, b'P', b'I', b'V', b'C', b'a', b'r', b'd', 0x90, 0x00,
                 ]),
-                // GET METADATA (slot 0x9D or PIN 0x80)
+                // GET METADATA (slot 0x9D, slot 0x9E, or PIN 0x80)
                 (0x00, 0xF7) => {
                     if apdu[3] == KEY_REF_PIN {
+                        if self.hide_pin_metadata {
+                            return Ok(vec![0x6D, 0x00]);
+                        }
                         let rem = *self.remaining_retries.borrow();
                         let mut meta = tlv(0x05, &[0x00])?;
                         meta.extend_from_slice(&tlv(0x06, &[3, rem])?);
+                        meta.extend_from_slice(&[0x90, 0x00]);
+                        return Ok(meta);
+                    }
+                    if apdu[3] == crate::piv::SLOT_CARD_AUTH {
+                        let Some(pk_9e) = &self.advertised_9e_public_sec1 else {
+                            return Ok(vec![0x6A, 0x88]);
+                        };
+                        let mut meta = Vec::new();
+                        meta.extend_from_slice(&tlv(0x01, &[ALG_ECC_P256])?);
+                        meta.extend_from_slice(&tlv(
+                            0x02,
+                            &[crate::piv::PIN_POLICY_NEVER, TOUCH_POLICY_NEVER],
+                        )?);
+                        meta.extend_from_slice(&tlv(0x03, &[ORIGIN_GENERATED])?);
+                        let pk_inner = tlv(0x86, pk_9e)?;
+                        meta.extend_from_slice(&tlv(0x04, &pk_inner)?);
                         meta.extend_from_slice(&[0x90, 0x00]);
                         return Ok(meta);
                     }
@@ -486,8 +518,19 @@ mod tests {
                     meta.extend_from_slice(&[0x90, 0x00]);
                     Ok(meta)
                 }
-                // VERIFY PIN
+                // VERIFY PIN (empty status check vs 8-byte verify)
                 (0x00, 0x20) => {
+                    if apdu.len() <= 5 {
+                        if self.hide_pin_metadata {
+                            return Ok(vec![0x90, 0x00]);
+                        }
+                        let rem = *self.remaining_retries.borrow();
+                        return if rem == 0 {
+                            Ok(vec![0x69, 0x83])
+                        } else {
+                            Ok(vec![0x63, 0xC0 | rem])
+                        };
+                    }
                     *self.verify_calls.borrow_mut() += 1;
                     if *self.remaining_retries.borrow() == 0 {
                         return Ok(vec![0x69, 0x83]);
@@ -529,13 +572,22 @@ mod tests {
                         Ok(vec![0x63, 0xC0 | *rem])
                     }
                 }
-                // GENERAL AUTHENTICATE ECDH
+                // GENERAL AUTHENTICATE ECDH (slot 0x9D requires PIN; slot 0x9E is PIN=NEVER)
                 (0x00, 0x87) => {
-                    if !*self.pin_verified_once.borrow() {
-                        return Ok(vec![0x69, 0x82]);
-                    }
-                    // Consume ALWAYS PIN immediately
-                    *self.pin_verified_once.borrow_mut() = false;
+                    let slot = apdu[3];
+                    let active_secret = if slot == crate::piv::SLOT_CARD_AUTH {
+                        let Some(sec_9e) = &self.secret_key_9e else {
+                            return Ok(vec![0x6A, 0x88]);
+                        };
+                        sec_9e
+                    } else {
+                        if !*self.pin_verified_once.borrow() {
+                            return Ok(vec![0x69, 0x82]);
+                        }
+                        // Consume ALWAYS PIN immediately
+                        *self.pin_verified_once.borrow_mut() = false;
+                        &self.secret_key
+                    };
 
                     let outer = crate::piv::find_tlv(&apdu[5..], 0x7C).unwrap();
                     let peer_bytes = crate::piv::find_tlv(outer, 0x85).unwrap();
@@ -543,10 +595,8 @@ mod tests {
                         replayed
                     } else {
                         let peer_pub = p256_public_from_sec1(peer_bytes)?;
-                        let shared = diffie_hellman(
-                            self.secret_key.to_nonzero_scalar(),
-                            peer_pub.as_affine(),
-                        );
+                        let shared =
+                            diffie_hellman(active_secret.to_nonzero_scalar(), peer_pub.as_affine());
                         let mut out = [0u8; 32];
                         out.copy_from_slice(shared.raw_secret_bytes());
                         out
@@ -716,6 +766,7 @@ mod tests {
         let puk_err = crate::enroll::unblock_pin_with_transport(
             &wrong_card,
             Some(&vault.card_pub_fingerprint),
+            None,
             true,
             b"12345678",
             b"654321",
@@ -733,6 +784,7 @@ mod tests {
         let unblocked_err = crate::enroll::unblock_pin_with_transport(
             &enrolled_card,
             Some(&vault.card_pub_fingerprint),
+            None,
             true,
             b"87654321",
             b"654321",
@@ -764,6 +816,7 @@ mod tests {
         let fp = crate::enroll::unblock_pin_with_transport(
             &enrolled_card,
             Some(&vault.card_pub_fingerprint),
+            None,
             true,
             b"87654321",
             b"654321",
@@ -781,5 +834,73 @@ mod tests {
         )
         .unwrap();
         assert_eq!(unlocked_pw.as_str(), "REAL-WINDOWS-SECRET");
+    }
+
+    #[test]
+    fn pre_pin_9e_blocks_evil_maid_pin_phishing_and_lockscreen_puk_fails_closed_on_none() {
+        let mut real_card =
+            SimulatedPivCard::with_key_byte(0x42, b"123456", b"87654321", None, PIN_POLICY_ALWAYS);
+        let sec_9e = SecretKey::from_bytes((&[0x55u8; 32]).into()).unwrap();
+        let pub_9e = p256_public_to_sec1(&sec_9e.public_key());
+        real_card.secret_key_9e = Some(sec_9e);
+        real_card.advertised_9e_public_sec1 = Some(pub_9e.clone());
+        let vault = build_test_vault(&real_card.advertised_public_sec1, "SECRET-PW");
+
+        // Evil-Maid fake card clones BOTH `0x9D` and `0x9E` public keys, hoping to record
+        // the user's plaintext PIN or PUK!
+        let mut evil_maid =
+            SimulatedPivCard::with_key_byte(0x99, b"123456", b"87654321", None, PIN_POLICY_ALWAYS);
+        evil_maid.advertised_public_sec1 = real_card.advertised_public_sec1.clone();
+        evil_maid.secret_key_9e = Some(SecretKey::from_bytes((&[0x77u8; 32]).into()).unwrap());
+        evil_maid.advertised_9e_public_sec1 = Some(pub_9e.clone());
+
+        // Pre-PIN `0x9E` challenge rejects `evil_maid` BEFORE `verify_pin` is ever called!
+        let connected = AuthPipeline::start(vault.clone(), "S-1-5-21-100", "alice", "WORKSTATION")
+            .unwrap()
+            .connect_with_transport(&evil_maid)
+            .unwrap();
+        let err = connected.verify_pre_pin_card_auth(&pub_9e).unwrap_err();
+        assert!(matches!(err, AuthError::WrongCard));
+        assert_eq!(
+            *evil_maid.verify_calls.borrow(),
+            0,
+            "Evil-Maid fake card must receive ZERO VERIFY PIN commands when 0x9E is bound"
+        );
+
+        // Pre-PUK `0x9E` challenge ALSO blocks `evil_maid` BEFORE `00 2C` PUK is ever sent!
+        *evil_maid.remaining_retries.borrow_mut() = 0;
+        let puk_err = crate::enroll::unblock_pin_with_transport(
+            &evil_maid,
+            Some(&vault.card_pub_fingerprint),
+            Some(&pub_9e),
+            true,
+            b"87654321",
+            b"654321",
+        )
+        .unwrap_err();
+        assert!(matches!(puk_err, AuthError::WrongCard));
+        assert_eq!(*evil_maid.reset_retry_calls.borrow(), 0);
+
+        // Real card passes `0x9E` pre-PIN challenge!
+        let real_conn = AuthPipeline::start(vault.clone(), "S-1-5-21-100", "alice", "WORKSTATION")
+            .unwrap()
+            .connect_with_transport(&real_card)
+            .unwrap();
+        real_conn.verify_pre_pin_card_auth(&pub_9e).unwrap();
+
+        // Fail-closed test: if a card omits PIN retry metadata (`Ok(None)`), Lock-Screen
+        // PUK unblock (`require_pin_blocked = true`) MUST reject it!
+        real_card.hide_pin_metadata = true;
+        let none_meta_err = crate::enroll::unblock_pin_with_transport(
+            &real_card,
+            Some(&vault.card_pub_fingerprint),
+            Some(&pub_9e),
+            true,
+            b"87654321",
+            b"654321",
+        )
+        .unwrap_err();
+        assert!(matches!(none_meta_err, AuthError::CardPolicy(_)));
+        assert_eq!(*real_card.reset_retry_calls.borrow(), 0);
     }
 }

@@ -24,8 +24,9 @@ use scard_core::piv::{
     PIN_POLICY_ONCE, TOUCH_POLICY_ALWAYS, TOUCH_POLICY_CACHED, TOUCH_POLICY_NEVER,
 };
 use scard_core::storage::{
-    clear_last_attempt_cooldown, clear_pinned_f9, read_pinned_f9, read_vault,
-    stage_pending_vault_with_backup, write_touch_policy, write_vault,
+    clear_card_auth_9e_pub, clear_last_attempt_cooldown, clear_pinned_f9, purge_vault_backup,
+    read_card_auth_9e_pub, read_pinned_f9, read_vault, stage_pending_vault_with_backup,
+    write_card_auth_9e_pub, write_touch_policy, write_vault,
 };
 use scard_core::VaultBlob;
 use std::ffi::c_void;
@@ -81,7 +82,6 @@ struct AppState {
 
 struct PreparedRotation {
     user: UserInfo,
-    lockout_threshold: u32,
     new_password: Zeroizing<String>,
     dek: Zeroizing<[u8; 32]>,
     candidate_vault: VaultBlob,
@@ -91,6 +91,7 @@ struct PreparedRotation {
     touch_policy: u8,
     pin_is_default: bool,
     puk_is_default: bool,
+    card_auth_9e_pub: Option<Vec<u8>>,
 }
 
 enum WorkerOutcome {
@@ -394,11 +395,24 @@ fn clear_attestation_cli() -> windows::core::Result<()> {
 fn unblock_pin_cli(puk_arg: &str, new_pin_arg: &str) -> windows::core::Result<()> {
     let puk = Zeroizing::new(puk_arg.as_bytes().to_vec());
     let new_pin = Zeroizing::new(new_pin_arg.as_bytes().to_vec());
-    let expected_fp = scard_core::current_user()
-        .ok()
-        .and_then(|u| read_vault(&u.sid).ok().flatten())
-        .map(|v| v.card_pub_fingerprint);
-    match unblock_card_pin(None, expected_fp.as_ref(), false, &puk, &new_pin) {
+    let (expected_fp, expected_9e) = match scard_core::current_user() {
+        Ok(u) => (
+            read_vault(&u.sid)
+                .ok()
+                .flatten()
+                .map(|v| v.card_pub_fingerprint),
+            read_card_auth_9e_pub(&u.sid).ok().flatten(),
+        ),
+        Err(_) => (None, None),
+    };
+    match unblock_card_pin(
+        None,
+        expected_fp.as_ref(),
+        expected_9e.as_deref(),
+        false,
+        &puk,
+        &new_pin,
+    ) {
         Ok(fp_opt) => {
             if let Some(fp) = fp_opt {
                 let _ = clear_last_attempt_cooldown(&fp);
@@ -924,8 +938,7 @@ unsafe fn start_setup_with_rotation(hwnd: HWND) {
 
             let user =
                 scard_core::current_user().map_err(|e| format!("Account lookup failed: {e}"))?;
-            let safety =
-                verify_local_workgroup_account(&user.username).map_err(|e| e.to_string())?;
+            let _ = verify_local_workgroup_account(&user.username).map_err(|e| e.to_string())?;
             validate_windows_password(&user, &current_password)
                 .map_err(|e| format!("Current Windows password is incorrect: {e}"))?;
 
@@ -970,7 +983,6 @@ unsafe fn start_setup_with_rotation(hwnd: HWND) {
 
             Ok(PreparedRotation {
                 user,
-                lockout_threshold: safety.lockout_threshold,
                 new_password,
                 dek: enrolled.dek,
                 candidate_vault: enrolled.vault,
@@ -982,6 +994,7 @@ unsafe fn start_setup_with_rotation(hwnd: HWND) {
                 touch_policy: enrolled.touch_policy,
                 pin_is_default: enrolled.pin_is_default,
                 puk_is_default: enrolled.puk_is_default,
+                card_auth_9e_pub: enrolled.card_auth_9e_pub,
             })
         })();
 
@@ -1086,13 +1099,25 @@ unsafe fn commit_confirmed_rotation(hwnd: HWND, prepared: PreparedRotation) {
 
             write_vault(&user.sid, &final_vault).map_err(|e| e.to_string())?;
             write_touch_policy(&user.sid, prepared.touch_policy).map_err(|e| e.to_string())?;
+            if let Some(pub_9e) = &prepared.card_auth_9e_pub {
+                write_card_auth_9e_pub(&user.sid, pub_9e).map_err(|e| e.to_string())?;
+            } else {
+                let _ = clear_card_auth_9e_pub(&user.sid);
+            }
             validate_windows_password(user, &prepared.new_password)
                 .map_err(|e| format!("Post-rotation LogonUserW check failed: {e}"))?;
+            // Scrub and purge historical `VaultBlob.bak` once the new password & vault are verified!
+            let _ = purge_vault_backup(&user.sid);
             Ok(())
         })();
 
         match commit_res {
             Ok(()) => {
+                let guard_9e = if prepared.card_auth_9e_pub.is_some() {
+                    "enabled (slot 0x9E P-256 PIN=NEVER verified)"
+                } else {
+                    "not configured (optional: provision slot 0x9E P-256 PIN=NEVER)"
+                };
                 let mut report = format!(
                     "Setup and password rotation complete.\r\n\
                      Account:        {}\\{}\r\n\
@@ -1100,8 +1125,9 @@ unsafe fn commit_confirmed_rotation(hwnd: HWND, prepared: PreparedRotation) {
                      Card:           {}\r\n\
                      9D Fingerprint: {}\r\n\
                      0xF9 Root:      {}\r\n\
+                     Pre-PIN 0x9E:   {}\r\n\
                      Card Self-Test: succeeded\r\n\
-                     Password:       rotated to 36-char recovery password (never expires)\r\n\
+                     Password:       rotated to 36-char recovery password (180-bit entropy, never expires)\r\n\
                      {}\r\n",
                     user.domain,
                     user.username,
@@ -1109,18 +1135,19 @@ unsafe fn commit_confirmed_rotation(hwnd: HWND, prepared: PreparedRotation) {
                     prepared.card_name,
                     prepared.fingerprint_hex,
                     prepared.f9_status,
+                    guard_9e,
                     install_summary
                 );
-                if prepared.lockout_threshold == 0 {
-                    report.push_str(
-                        "\r\nSECURITY WARNING: Windows Account Lockout Threshold is currently 0 (disabled).\r\n\
-                         Run `net accounts /lockoutthreshold:5` in an elevated shell before enabling RDP.\r\n",
-                    );
-                }
                 if prepared.pin_is_default || prepared.puk_is_default {
                     report.push_str(
                         "\r\nSECURITY WARNING: Your smart card PIN (123456) and/or PUK (12345678) is still set to the factory default!\r\n\
                          Click 'Unblock PIN / PUK...' to set a custom PUK and PIN before production deployment.\r\n",
+                    );
+                }
+                if prepared.touch_policy == TOUCH_POLICY_NEVER {
+                    report.push_str(
+                        "\r\nADVISORY: Slot 0x9D has Touch Policy = NEVER. If you connect to remote hosts via RDP smart-card redirection,\r\n\
+                         provisioning 0x9D with Touch Policy = ALWAYS prevents remote processes from invoking your card without physical touch.\r\n",
                     );
                 }
                 post_outcome(
@@ -1233,13 +1260,25 @@ unsafe fn start_rebind_existing_password(hwnd: HWND) {
                 .map_err(|e| format!("Vault write failed: {e}"))?;
             write_touch_policy(&user.sid, enrolled.touch_policy)
                 .map_err(|e| format!("Touch policy write failed: {e}"))?;
+            if let Some(pub_9e) = &enrolled.card_auth_9e_pub {
+                write_card_auth_9e_pub(&user.sid, pub_9e)
+                    .map_err(|e| format!("0x9E key write failed: {e}"))?;
+            } else {
+                let _ = clear_card_auth_9e_pub(&user.sid);
+            }
 
             self_test_internal(&pin, &password, &user)?;
+            let _ = purge_vault_backup(&user.sid);
 
             let f9_status = match (enrolled.f9_fingerprint, enrolled.f9_newly_pinned) {
                 (Some(fp), true) => format!("{} (verified & newly pinned)", hex::encode(fp)),
                 (Some(fp), false) => format!("{} (verified against pinned root)", hex::encode(fp)),
                 (None, _) => "(card did not return 0xF9 attestation)".into(),
+            };
+            let guard_9e = if enrolled.card_auth_9e_pub.is_some() {
+                "enabled (slot 0x9E P-256 PIN=NEVER verified)"
+            } else {
+                "not configured (optional: provision slot 0x9E P-256 PIN=NEVER)"
             };
 
             let mut msg = format!(
@@ -1249,6 +1288,7 @@ unsafe fn start_rebind_existing_password(hwnd: HWND) {
                  Card:           {}\r\n\
                  9D Fingerprint: {}\r\n\
                  0xF9 Root:      {}\r\n\
+                 Pre-PIN 0x9E:   {}\r\n\
                  Self-Test:      succeeded\r\n\
                  {}\r\n",
                 user.domain,
@@ -1257,17 +1297,25 @@ unsafe fn start_rebind_existing_password(hwnd: HWND) {
                 enrolled.card_name.as_deref().unwrap_or("(unknown)"),
                 hex::encode(enrolled.card_pub_fingerprint),
                 f9_status,
+                guard_9e,
                 install_summary
             );
             if safety.lockout_threshold == 0 {
                 msg.push_str(
-                    "\r\nSECURITY WARNING: Account Lockout Threshold is 0. Enable `net accounts /lockoutthreshold:5`.\r\n",
+                    "\r\nSECURITY NOTE: Account Lockout Threshold is 0 while keeping an existing password.\r\n\
+                     Prefer 'Set up & rotate password' (180-bit random password, which needs no lockout threshold and avoids sole-admin DoS).\r\n\
+                     If you manually enable account lockout (`net accounts /lockoutthreshold:5 /lockoutduration:10`), never set permanent lockout on a sole admin account.\r\n",
                 );
             }
             if enrolled.pin_is_default || enrolled.puk_is_default {
                 msg.push_str(
                     "\r\nSECURITY WARNING: Your smart card PIN (123456) and/or PUK (12345678) is still set to the factory default!\r\n\
                      Click 'Unblock PIN / PUK...' to set a custom PUK and PIN before production deployment.\r\n",
+                );
+            }
+            if enrolled.touch_policy == TOUCH_POLICY_NEVER {
+                msg.push_str(
+                    "\r\nADVISORY: Slot 0x9D has Touch Policy = NEVER. Consider Touch Policy = ALWAYS when using RDP smart-card redirection.\r\n",
                 );
             }
             Ok(msg)
@@ -1518,16 +1566,26 @@ fn self_test_internal(pin: &str, expected_password: &str, user: &UserInfo) -> Re
         );
     }
 
-    let mut pin_bytes = Zeroizing::new(pin.as_bytes().to_vec());
-    let decrypted = scard_core::unlock(
-        vault,
-        &user.sid,
-        &user.username,
-        &user.computer,
-        None,
-        &mut pin_bytes,
-    )
-    .map_err(|error| format!("Unlock failed: {error}"))?;
+    let pin_bytes = Zeroizing::new(pin.as_bytes().to_vec());
+    let connected =
+        scard_core::AuthPipeline::start(vault, &user.sid, &user.username, &user.computer)
+            .and_then(|loaded| loaded.connect_card(None))
+            .map_err(|error| format!("Card connection failed: {error}"))?;
+    if let Ok(Some(pub_9e)) = read_card_auth_9e_pub(&user.sid) {
+        connected
+            .verify_pre_pin_card_auth(&pub_9e)
+            .map_err(|error| {
+                format!("Pre-PIN 0x9E hardware anti-phishing check failed: {error}")
+            })?;
+    }
+    let decrypted = connected
+        .verify_pin(&pin_bytes)
+        .and_then(|v| v.prove_freshness())
+        .and_then(|f| f.verify_pin_for_unwrap(&pin_bytes))
+        .and_then(|u| u.unwrap_dek())
+        .and_then(|k| k.decrypt_credential())
+        .map(|c| c.into_password())
+        .map_err(|error| format!("Unlock failed: {error}"))?;
 
     if !expected_password.is_empty()
         && !scard_core::crypto::constant_time_eq(decrypted.as_bytes(), expected_password.as_bytes())

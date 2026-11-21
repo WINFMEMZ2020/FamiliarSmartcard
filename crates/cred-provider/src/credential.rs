@@ -273,57 +273,6 @@ impl Credential_Impl {
         }
         self.clear_secrets_and_notify_ui();
     }
-
-    fn resolve_target_account(
-        &self,
-        typed_username: &str,
-        ppsz_status: *mut PWSTR,
-        pcpsi: *mut CREDENTIAL_PROVIDER_STATUS_ICON,
-    ) -> Option<(String, String, String)> {
-        match &self.mode {
-            TargetMode::BoundUser {
-                sid,
-                domain,
-                username,
-            } => Some((sid.clone(), domain.clone(), username.clone())),
-            TargetMode::ExplicitUser => {
-                if typed_username.is_empty() {
-                    // SAFETY: Out-pointers verified non-null by `GetSerialization`.
-                    unsafe {
-                        self.fail(
-                            ppsz_status,
-                            pcpsi,
-                            "Enter your local Windows username.".into(),
-                            CPSI_WARNING,
-                        );
-                    }
-                    return None;
-                }
-
-                // Uniform error message + small floor delay prevent local username enumeration
-                // when RDP is exposed without NLA.
-                match scard_core::account::lookup_local_account_by_name(typed_username) {
-                    Ok(info) if scard_core::storage::vault_exists(&info.sid) => {
-                        Some((info.sid, info.domain, info.username))
-                    }
-                    _ => {
-                        std::thread::sleep(std::time::Duration::from_millis(150));
-                        // SAFETY: Out-pointers verified non-null by `GetSerialization`.
-                        unsafe {
-                            self.fail(
-                                ppsz_status,
-                                pcpsi,
-                                "Sign-in failed. Verify the local username, Familiar Smartcard enrollment, and credentials."
-                                    .into(),
-                                CPSI_ERROR,
-                            );
-                        }
-                        None
-                    }
-                }
-            }
-        }
-    }
 }
 
 impl ICredentialProviderCredential_Impl for Credential_Impl {
@@ -697,26 +646,56 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
             };
 
             let computer = scard_core::account::computer_name().unwrap_or_else(|_| ".".into());
-            let Some((sid, domain, username)) =
-                self.resolve_target_account(&typed_username, ppsz_status, pcpsi)
-            else {
-                return Ok(());
-            };
-
-            let timeout_ms = match scard_core::storage::read_touch_policy(&sid) {
-                Some(TOUCH_POLICY_ALWAYS) | Some(TOUCH_POLICY_CACHED) => TOUCH_HELPER_TIMEOUT_MS,
-                _ => DEFAULT_HELPER_TIMEOUT_MS,
+            let (req_sid, req_username, explicit_user, timeout_ms) = match &self.mode {
+                TargetMode::BoundUser { sid, username, .. } => {
+                    let t = match scard_core::storage::read_touch_policy(sid) {
+                        Some(TOUCH_POLICY_ALWAYS) | Some(TOUCH_POLICY_CACHED) => {
+                            TOUCH_HELPER_TIMEOUT_MS
+                        }
+                        _ => DEFAULT_HELPER_TIMEOUT_MS,
+                    };
+                    (sid.clone(), username.clone(), false, t)
+                }
+                TargetMode::ExplicitUser => {
+                    if typed_username.is_empty() {
+                        // SAFETY: Verified non-null above.
+                        unsafe {
+                            self.fail(
+                                ppsz_status,
+                                pcpsi,
+                                "Enter your local Windows username.".into(),
+                                CPSI_WARNING,
+                            );
+                        }
+                        return Ok(());
+                    }
+                    // Delegate account lookup to `familiar-auth-helper.exe` so session
+                    // reader/card checks execute BEFORE username lookup (preventing any
+                    // username enumeration oracle over non-NLA RDP).
+                    (String::new(), typed_username, true, TOUCH_HELPER_TIMEOUT_MS)
+                }
             };
 
             let req = HelperRequest {
-                sid,
-                username: username.clone(),
+                sid: req_sid,
+                username: req_username,
                 computer,
+                explicit_user,
                 operation,
             };
 
-            let password = match invoke_auth_helper(&req, timeout_ms) {
-                HelperResponse::Success { password } => password,
+            let (domain, username, password) = match invoke_auth_helper(&req, timeout_ms) {
+                HelperResponse::Success {
+                    domain,
+                    username,
+                    password,
+                } => {
+                    let final_domain = match &self.mode {
+                        TargetMode::BoundUser { domain: d, .. } => d.clone(),
+                        TargetMode::ExplicitUser => domain,
+                    };
+                    (final_domain, username, password)
+                }
                 HelperResponse::Failure {
                     reason,
                     icon,

@@ -13,12 +13,17 @@ use scard_core::ipc::{
     HelperResponse,
 };
 use scard_core::storage::{
-    check_last_attempt_cooldown, clear_last_attempt_cooldown, start_last_attempt_cooldown,
-    LAST_ATTEMPT_COOLDOWN_SECS,
+    check_last_attempt_cooldown, clear_last_attempt_cooldown, read_card_auth_9e_pub,
+    start_last_attempt_cooldown, LAST_ATTEMPT_COOLDOWN_SECS,
 };
 use scard_core::AuthError;
 use std::io;
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
+
+const EXPLICIT_USER_UNIFORM_FLOOR: Duration = Duration::from_millis(220);
+const EXPLICIT_USER_UNIFORM_MSG: &str =
+    "Sign-in failed. Verify the local username, Familiar Smartcard enrollment, and credentials.";
 
 fn main() -> ExitCode {
     // Install a silent panic hook so no internal state or stack value is ever
@@ -30,7 +35,7 @@ fn main() -> ExitCode {
     #[cfg(debug_assertions)]
     if let Some(hang_arg) = std::env::args().nth(1) {
         if hang_arg == "--test-simulate-hang" {
-            std::thread::sleep(std::time::Duration::from_secs(30));
+            std::thread::sleep(Duration::from_secs(30));
             return ExitCode::from(2);
         }
     }
@@ -52,7 +57,19 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn uniform_explicit_failure(started: Instant) -> HelperResponse {
+    if let Some(rem) = EXPLICIT_USER_UNIFORM_FLOOR.checked_sub(started.elapsed()) {
+        std::thread::sleep(rem);
+    }
+    HelperResponse::Failure {
+        reason: HelperFailureReason::Generic,
+        icon: HelperIcon::Error,
+        message: EXPLICIT_USER_UNIFORM_MSG.into(),
+    }
+}
+
 fn run_once() -> HelperResponse {
+    let started = Instant::now();
     let stdin = io::stdin();
     let raw_req = match read_framed(stdin.lock()) {
         Ok(frame) => frame,
@@ -76,9 +93,36 @@ fn run_once() -> HelperResponse {
         }
     };
 
-    let vault = match scard_core::storage::read_vault(&req.sid) {
+    // ANTI-ENUMERATION FOR "OTHER USER" (`explicit_user == true`):
+    // Check whether a PIV smart card is present in the session BEFORE looking up the
+    // username! Callers without a card receive the exact same reader/card warning for
+    // both existent and non-existent usernames; callers with an unrelated dummy card
+    // receive the exact same 220ms-padded generic failure whether the username exists or not.
+    let (sid, domain, username) = if req.explicit_user {
+        if let Err(card_err) = scard_core::ensure_piv_card_present_in_session() {
+            return HelperResponse::Failure {
+                reason: HelperFailureReason::Generic,
+                icon: icon_for_error(&card_err),
+                message: format_user_error(&card_err),
+            };
+        }
+        match scard_core::account::lookup_local_account_by_name(&req.username) {
+            Ok(info) => (info.sid, info.domain, info.username),
+            Err(_) => return uniform_explicit_failure(started),
+        }
+    } else {
+        let resolved_domain = scard_core::account::lookup_account_by_sid(&req.sid)
+            .map(|u| u.domain)
+            .unwrap_or_else(|_| req.computer.clone());
+        (req.sid.clone(), resolved_domain, req.username.clone())
+    };
+
+    let vault = match scard_core::storage::read_vault(&sid) {
         Ok(Some(vault)) => vault,
         Ok(None) => {
+            if req.explicit_user {
+                return uniform_explicit_failure(started);
+            }
             return HelperResponse::Failure {
                 reason: HelperFailureReason::Generic,
                 icon: HelperIcon::Error,
@@ -86,6 +130,9 @@ fn run_once() -> HelperResponse {
             };
         }
         Err(error) => {
+            if req.explicit_user {
+                return uniform_explicit_failure(started);
+            }
             return HelperResponse::Failure {
                 reason: HelperFailureReason::Generic,
                 icon: HelperIcon::Error,
@@ -94,55 +141,55 @@ fn run_once() -> HelperResponse {
         }
     };
 
-    let current_last_set = match scard_core::account::password_last_set(&req.username) {
-        Ok(value) => value,
-        Err(_) => {
-            return HelperResponse::Failure {
-                reason: HelperFailureReason::Generic,
-                icon: HelperIcon::Error,
-                message: "Could not verify local account state.".into(),
-            };
-        }
-    };
-
-    if !scard_core::vault::password_last_set_matches(vault.password_last_set, current_last_set) {
-        return HelperResponse::Failure {
-            reason: HelperFailureReason::Generic,
-            icon: HelperIcon::Error,
-            message:
-                "The Windows password has changed; sign in with your recovery password and re-enroll."
-                    .into(),
-        };
-    }
+    let opt_9e_pub = read_card_auth_9e_pub(&sid).ok().flatten();
 
     match req.operation {
-        HelperOperation::Unlock { mut pin } => {
-            handle_unlock(vault, &req.sid, &req.username, &req.computer, &mut pin)
-        }
+        HelperOperation::Unlock { mut pin } => handle_unlock(
+            vault,
+            &sid,
+            &domain,
+            &username,
+            &req.computer,
+            opt_9e_pub.as_deref(),
+            req.explicit_user,
+            started,
+            &mut pin,
+        ),
         HelperOperation::UnblockAndUnlock { puk, mut new_pin } => handle_unblock_and_unlock(
             vault,
-            &req.sid,
-            &req.username,
+            &sid,
+            &domain,
+            &username,
             &req.computer,
+            opt_9e_pub.as_deref(),
+            req.explicit_user,
+            started,
             &puk,
             &mut new_pin,
         ),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_unlock(
     vault: scard_core::VaultBlob,
     sid: &str,
+    domain: &str,
     username: &str,
     computer: &str,
+    opt_9e_pub: Option<&[u8]>,
+    explicit_user: bool,
+    started: Instant,
     pin: &mut zeroize::Zeroizing<Vec<u8>>,
 ) -> HelperResponse {
     let card_fp = vault.card_pub_fingerprint;
+    let stored_pw_last_set = vault.password_last_set;
 
     let connected = match scard_core::AuthPipeline::start(vault, sid, username, computer)
         .and_then(|loaded| loaded.connect_card(None))
     {
         Ok(c) => c,
+        Err(AuthError::WrongCard) if explicit_user => return uniform_explicit_failure(started),
         Err(error) => {
             return HelperResponse::Failure {
                 reason: HelperFailureReason::Generic,
@@ -152,8 +199,40 @@ fn handle_unlock(
         }
     };
 
-    // Enforce the 60s safety cooldown INSIDE the exclusive PC/SC card transaction
-    // so concurrent Console + RDP sessions can never race past the final-try gate!
+    // Phase 4 Pre-PIN Hardware Anti-Phishing: when slot `0x9E` (`PIN=NEVER`) was bound
+    // during enrollment, challenge `0x9E` BEFORE sending `VERIFY PIN` or revealing account state!
+    if let Some(pub_9e) = opt_9e_pub {
+        if let Err(err) = connected.verify_pre_pin_card_auth(pub_9e) {
+            if explicit_user {
+                return uniform_explicit_failure(started);
+            }
+            return HelperResponse::Failure {
+                reason: HelperFailureReason::Generic,
+                icon: icon_for_error(&err),
+                message: format_user_error(&err),
+            };
+        }
+    }
+
+    // Card identity is now matched! Verify static password-last-set marker.
+    let Ok(current_last_set) = scard_core::account::password_last_set(username) else {
+        return HelperResponse::Failure {
+            reason: HelperFailureReason::Generic,
+            icon: HelperIcon::Error,
+            message: "Could not verify local account state.".into(),
+        };
+    };
+    if !scard_core::vault::password_last_set_matches(stored_pw_last_set, current_last_set) {
+        return HelperResponse::Failure {
+            reason: HelperFailureReason::Generic,
+            icon: HelperIcon::Error,
+            message:
+                "The Windows password has changed; sign in with your recovery password and re-enroll."
+                    .into(),
+        };
+    }
+
+    // Enforce the 60s safety cooldown INSIDE the exclusive PC/SC card transaction!
     if let Ok(Some(rem_secs)) = check_last_attempt_cooldown(&card_fp) {
         match connected.query_pin_remaining() {
             Ok(Some(0)) => {
@@ -165,7 +244,6 @@ fn handle_unlock(
                 };
             }
             Ok(Some(r)) if r > 1 => {
-                // Card was already unblocked/verified elsewhere; clear stale cooldown.
                 let _ = clear_last_attempt_cooldown(&card_fp);
             }
             Ok(_) => {
@@ -198,7 +276,11 @@ fn handle_unlock(
     match unlock_res {
         Ok(password) => {
             let _ = clear_last_attempt_cooldown(&card_fp);
-            HelperResponse::Success { password }
+            HelperResponse::Success {
+                domain: domain.to_string(),
+                username: username.to_string(),
+                password,
+            }
         }
         Err(AuthError::PinIncorrect(1)) => {
             let _ = start_last_attempt_cooldown(&card_fp, LAST_ATTEMPT_COOLDOWN_SECS);
@@ -226,24 +308,33 @@ fn handle_unlock(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_unblock_and_unlock(
     vault: scard_core::VaultBlob,
     sid: &str,
+    domain: &str,
     username: &str,
     computer: &str,
+    opt_9e_pub: Option<&[u8]>,
+    explicit_user: bool,
+    started: Instant,
     puk: &zeroize::Zeroizing<Vec<u8>>,
     new_pin: &mut zeroize::Zeroizing<Vec<u8>>,
 ) -> HelperResponse {
     let card_fp = vault.card_pub_fingerprint;
-    // On the Lock Screen, `require_pin_blocked = true` prevents unblocked cards from
-    // having their PUK tested or intentionally exhausted!
+    let stored_pw_last_set = vault.password_last_set;
+
     if let Err(error) = scard_core::unblock_card_pin(
         None,
         Some(&card_fp),
+        opt_9e_pub,
         true,
         puk.as_slice(),
         new_pin.as_slice(),
     ) {
+        if matches!(error, AuthError::WrongCard) && explicit_user {
+            return uniform_explicit_failure(started);
+        }
         return match error {
             AuthError::PukIncorrect(1) => HelperResponse::Failure {
                 reason: HelperFailureReason::CooldownActive,
@@ -281,8 +372,29 @@ fn handle_unblock_and_unlock(
 
     let _ = clear_last_attempt_cooldown(&card_fp);
 
+    let Ok(current_last_set) = scard_core::account::password_last_set(username) else {
+        return HelperResponse::Failure {
+            reason: HelperFailureReason::Generic,
+            icon: HelperIcon::Error,
+            message: "Could not verify local account state.".into(),
+        };
+    };
+    if !scard_core::vault::password_last_set_matches(stored_pw_last_set, current_last_set) {
+        return HelperResponse::Failure {
+            reason: HelperFailureReason::Generic,
+            icon: HelperIcon::Error,
+            message:
+                "Familiar Smartcard PIN was unblocked, but the Windows password has changed; sign in with your recovery password and re-enroll."
+                    .into(),
+        };
+    }
+
     match scard_core::unlock(vault, sid, username, computer, None, new_pin) {
-        Ok(password) => HelperResponse::Success { password },
+        Ok(password) => HelperResponse::Success {
+            domain: domain.to_string(),
+            username: username.to_string(),
+            password,
+        },
         Err(error) => HelperResponse::Failure {
             reason: HelperFailureReason::Generic,
             icon: icon_for_error(&error),

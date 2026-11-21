@@ -64,6 +64,9 @@ Launch `familiar-enroll.exe` (requests UAC elevation automatically):
 
 ## Security Notes
 
-- Always configure a Windows Account Lockout Threshold (`net accounts /lockoutthreshold:5`).
-- Never expose RDP TCP 3389 directly to the internet or untrusted LANs when NLA (`UserAuthentication=0`) is disabled; restrict port 3389 to VPN/WireGuard/IPsec interfaces.
-- Before production use, change the default PIV PIN (`123456`), PUK (`12345678`), and Management Key on your PIV smart card or security key. If you replace or factory-reset your card, run `familiar-enroll.exe --repin-attestation` (or click `Re-pin card root`).
+- **Sole-Administrator Lockout Safety**: When using **`Set up & rotate password (Recommended)`**, the 36-character random recovery password provides **180 bits of entropy** (immune to online guessing without needing a SAM account lockout threshold — avoiding a 5-try remote DoS lockout that would also block `STATUS_ACCOUNT_LOCKED_OUT` smart-card sign-ins on a sole-administrator machine). If you use `Re-bind` with a human password and manually enable `net accounts /lockoutthreshold:5`, always configure a short auto-unlock duration (never permanent lockout on a sole admin account).
+- **Network Boundary for Non-NLA RDP**: Never expose RDP TCP 3389 directly to the internet or untrusted LANs when NLA (`UserAuthentication=0`) is disabled; restrict port 3389 to WireGuard / Tailscale / IPsec interfaces.
+- **Card Hardening (`TOUCH_POLICY_ALWAYS` & Optional Slot `0x9E` Pre-PIN Guard)**:
+  - Before production use, change the default PIV PIN (`123456`), PUK (`12345678`), and Management Key.
+  - Provisioning slot `0x9D` with `TOUCH_POLICY_ALWAYS` prevents processes inside a remote RDP session from silently invoking your redirected smart card without physical finger touch.
+  - Optionally provisioning an on-card `ECC P-256` (`PIN=NEVER`) key in PIV slot **`0x9E` (`Card Authentication`)** automatically activates **Pre-PIN Hardware Anti-Phishing** during enrollment, challenging `0x9E` dynamically *before* sending a single byte of your PIN or PUK.

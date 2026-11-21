@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use zeroize::Zeroizing;
 
 pub const IPC_MAGIC: [u8; 4] = *b"FSH1";
-pub const IPC_VERSION: u8 = 2;
+pub const IPC_VERSION: u8 = 3;
 pub const MAX_IPC_FRAME_LEN: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,14 +71,19 @@ pub enum HelperOperation {
 }
 
 pub struct HelperRequest {
+    /// Empty when `explicit_user == true` (`auth-helper` resolves the account after
+    /// verifying reader/card presence so invalid usernames never leak distinct errors).
     pub sid: String,
     pub username: String,
     pub computer: String,
+    pub explicit_user: bool,
     pub operation: HelperOperation,
 }
 
 pub enum HelperResponse {
     Success {
+        domain: String,
+        username: String,
         password: Zeroizing<String>,
     },
     Failure {
@@ -122,6 +127,7 @@ impl HelperRequest {
         let mut payload = Zeroizing::new(Vec::with_capacity(224));
         payload.extend_from_slice(&IPC_MAGIC);
         payload.push(IPC_VERSION);
+        payload.push(u8::from(self.explicit_user));
         push_field(&mut payload, self.sid.as_bytes())?;
         push_field(&mut payload, self.username.as_bytes())?;
         push_field(&mut payload, self.computer.as_bytes())?;
@@ -145,13 +151,18 @@ impl HelperRequest {
     }
 
     pub fn decode(data: &[u8]) -> Result<Self> {
-        if data.len() < 6 || data.len() > MAX_IPC_FRAME_LEN {
+        if data.len() < 7 || data.len() > MAX_IPC_FRAME_LEN {
             return Err(AuthError::Ipc("invalid IPC request frame size".into()));
         }
         if data[..4] != IPC_MAGIC || data[4] != IPC_VERSION {
             return Err(AuthError::Ipc("bad IPC request magic or version".into()));
         }
-        let mut pos = 5usize;
+        let explicit_user = match data[5] {
+            0 => false,
+            1 => true,
+            _ => return Err(AuthError::Ipc("invalid explicit_user flag".into())),
+        };
+        let mut pos = 6usize;
         let sid = std::str::from_utf8(read_field(data, &mut pos, 184)?)
             .map_err(|_| AuthError::Ipc("invalid UTF-8 in SID".into()))?
             .to_string();
@@ -189,6 +200,7 @@ impl HelperRequest {
             sid,
             username,
             computer,
+            explicit_user,
             operation,
         })
     }
@@ -196,14 +208,20 @@ impl HelperRequest {
 
 impl HelperResponse {
     pub fn encode(&self) -> Result<Zeroizing<Vec<u8>>> {
-        let mut payload = Zeroizing::new(Vec::with_capacity(320));
+        let mut payload = Zeroizing::new(Vec::with_capacity(384));
         payload.extend_from_slice(&IPC_MAGIC);
         payload.push(IPC_VERSION);
         match self {
-            HelperResponse::Success { password } => {
+            HelperResponse::Success {
+                domain,
+                username,
+                password,
+            } => {
                 payload.push(1u8);
                 payload.push(HelperFailureReason::Generic as u8);
                 payload.push(HelperIcon::None as u8);
+                push_field(&mut payload, domain.as_bytes())?;
+                push_field(&mut payload, username.as_bytes())?;
                 push_field(&mut payload, password.as_bytes())?;
             }
             HelperResponse::Failure {
@@ -241,22 +259,34 @@ impl HelperResponse {
         let reason = HelperFailureReason::from_u8(data[6])?;
         let icon = HelperIcon::from_u8(data[7])?;
         let mut pos = 8usize;
-        let body = read_field(data, &mut pos, 512)?;
-        if pos != data.len() {
-            return Err(AuthError::Ipc("trailing bytes in IPC response".into()));
-        }
         match tag {
             1 => {
+                let domain = std::str::from_utf8(read_field(data, &mut pos, 128)?)
+                    .map_err(|_| AuthError::Ipc("invalid UTF-8 in domain".into()))?
+                    .to_string();
+                let username = std::str::from_utf8(read_field(data, &mut pos, 256)?)
+                    .map_err(|_| AuthError::Ipc("invalid UTF-8 in username".into()))?
+                    .to_string();
+                let body = read_field(data, &mut pos, 512)?;
+                if pos != data.len() {
+                    return Err(AuthError::Ipc("trailing bytes in IPC response".into()));
+                }
                 let mut owned = Zeroizing::new(Vec::with_capacity(body.len()));
                 owned.extend_from_slice(body);
                 let text = std::str::from_utf8(&owned)
                     .map_err(|_| AuthError::Ipc("invalid UTF-8 in decrypted password".into()))?
                     .to_string();
                 Ok(HelperResponse::Success {
+                    domain,
+                    username,
                     password: Zeroizing::new(text),
                 })
             }
             0 => {
+                let body = read_field(data, &mut pos, 512)?;
+                if pos != data.len() {
+                    return Err(AuthError::Ipc("trailing bytes in IPC response".into()));
+                }
                 let message = String::from_utf8_lossy(body).to_string();
                 Ok(HelperResponse::Failure {
                     reason,
@@ -310,6 +340,7 @@ mod tests {
             sid: "S-1-5-21-1000-2000-3000-1001".into(),
             username: "alice".into(),
             computer: "WORKSTATION".into(),
+            explicit_user: false,
             operation: HelperOperation::Unlock {
                 pin: Zeroizing::new(b"123456".to_vec()),
             },
@@ -322,22 +353,25 @@ mod tests {
         let decoded = HelperRequest::decode(&raw_read).unwrap();
         assert_eq!(decoded.sid, req.sid);
         assert_eq!(decoded.username, req.username);
+        assert!(!decoded.explicit_user);
         match decoded.operation {
             HelperOperation::Unlock { pin } => assert_eq!(pin.as_slice(), b"123456"),
             HelperOperation::UnblockAndUnlock { .. } => panic!("expected Unlock"),
         }
 
-        // UnblockAndUnlock roundtrip
+        // UnblockAndUnlock roundtrip (with explicit_user = true)
         let unblock_req = HelperRequest {
-            sid: "S-1-5-21-1000-2000-3000-1001".into(),
+            sid: String::new(),
             username: "alice".into(),
             computer: "WORKSTATION".into(),
+            explicit_user: true,
             operation: HelperOperation::UnblockAndUnlock {
                 puk: Zeroizing::new(b"12345678".to_vec()),
                 new_pin: Zeroizing::new(b"654321".to_vec()),
             },
         };
         let unblock_dec = HelperRequest::decode(&unblock_req.encode().unwrap()).unwrap();
+        assert!(unblock_dec.explicit_user);
         match unblock_dec.operation {
             HelperOperation::UnblockAndUnlock { puk, new_pin } => {
                 assert_eq!(puk.as_slice(), b"12345678");
@@ -347,6 +381,8 @@ mod tests {
         }
 
         let resp = HelperResponse::Success {
+            domain: "WORKSTATION".into(),
+            username: "alice".into(),
             password: Zeroizing::new("ABCD-EFGH-2345".into()),
         };
         let resp_enc = resp.encode().unwrap();
@@ -354,7 +390,15 @@ mod tests {
         write_framed(&mut resp_wire, &resp_enc).unwrap();
         let resp_raw = read_framed(Cursor::new(&resp_wire)).unwrap();
         match HelperResponse::decode(&resp_raw).unwrap() {
-            HelperResponse::Success { password } => assert_eq!(password.as_str(), "ABCD-EFGH-2345"),
+            HelperResponse::Success {
+                domain,
+                username,
+                password,
+            } => {
+                assert_eq!(domain, "WORKSTATION");
+                assert_eq!(username, "alice");
+                assert_eq!(password.as_str(), "ABCD-EFGH-2345");
+            }
             HelperResponse::Failure { .. } => panic!("expected success"),
         }
 

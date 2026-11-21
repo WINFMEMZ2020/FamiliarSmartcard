@@ -2,8 +2,8 @@
 
 > **重要安全前提**：
 > - 支持符合 **NIST SP 800-73-4 标准 PIV 协议** 的智能卡与硬件安全密钥（如 YubiKey、JavaCard PIV、开源 PIV 硬件密钥等）。当卡片支持 `00 F7` 元数据扩展时，程序会强制要求 `0x9D` 槽位为**卡内生成（On-card）**的 **ECC P-256** 密钥且 **`PIN policy = ALWAYS`**（`ONCE`、`NEVER` 或外部导入私钥会被硬性拒绝）；对不含私有扩展的标准 PIV 卡则兼容读取 `5F C1 0B` 标准证书公钥。
-> - 正式投入使用前，请务必修改卡片出厂默认的 PIV PIN（`123456`）、PUK（`12345678`）与 Management Key，并完成硬件自身的防篡改固化。
-> - 开启账户锁定策略（管理员运行 `net accounts /lockoutthreshold:5`），且在关闭 RDP NLA 时**只允许通过 WireGuard / Tailscale / IPsec 访问 3389 端口**。
+> - **进阶硬件加固（推荐）**：若需通过 RDP 重定向智能卡，建议将 `0x9D` 设为 **`TOUCH_POLICY_ALWAYS`**（防远端后台静默调用）；若同时在 **`0x9E`（Card Authentication）** 槽位生成片上 `ECC P-256 (PIN=NEVER)` 密钥，绑卡时会自动启用 **Pre-PIN 硬件防调包保护**（在发出明文 PIN/PUK 前先校验 `0x9E` 私钥挑战）。
+> - 正式投入使用前，请务必修改卡片出厂默认的 PIV PIN（`123456`）、PUK（`12345678`）与 Management Key，并在关闭 RDP NLA 时**只允许通过 WireGuard / Tailscale / IPsec 访问 3389 端口**。
 
 所有运行时 UI、命令行与锁屏提示均为英文（遵循 `PROJECT_PRINCIPLES.md`）；本文档为中文操作说明。
 
@@ -34,10 +34,12 @@ rescue_delete_cp.reg         # WinRE / 安全模式救援注册表文件
    Start-Service SCardSvr
    ```
 2. **账户类型**：目标账户必须是独立的 **Windows 本地账户（Workgroup）**，不支持 AD 域账户或 Microsoft 云账户。
-3. **账户锁定策略（强烈建议）**：防止攻击者绕过智能卡直接爆破旁边的原生密码框：
-   ```powershell
-   net accounts /lockoutthreshold:5 /lockoutduration:15 /lockoutwindow:15
-   ```
+3. **关于系统账户锁定策略（单管理员机器特别注意）**：
+   - 若使用推荐的 **`Set up & rotate password`** 主流程，系统密码已替换为 **180 bits 高熵随机恢复密码**，数学上免疫在线穷举，**无需开启 `lockoutthreshold`**（对只有唯一管理员的机器，不开启系统账户锁定反而能避免攻击者故意输错 5 次触发 `STATUS_ACCOUNT_LOCKED_OUT` 把智能卡也一并挡在门外）。
+   - 仅当使用不改密的 `Re-bind` 模式且确需手动开启系统账户锁定时，**务必同时设置自动解锁时长**（严禁在单管理员机器上配置永久锁定）：
+     ```powershell
+     net accounts /lockoutthreshold:5 /lockoutduration:10 /lockoutwindow:10
+     ```
 4. **验证读卡器、PIN/PUK 状态与卡片策略**：
    ```powershell
    .\familiar-enroll.exe --probe

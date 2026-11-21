@@ -343,6 +343,7 @@ mod tests {
             sid: "S-1-5-21-1000-1001".into(),
             username: "nobody".into(),
             computer: "LOCAL".into(),
+            explicit_user: false,
             operation: scard_core::ipc::HelperOperation::Unlock {
                 pin: Zeroizing::new(b"123456".to_vec()),
             },
@@ -361,6 +362,7 @@ mod tests {
             sid: "S-1-5-21-1000-1001".into(),
             username: "nobody".into(),
             computer: "LOCAL".into(),
+            explicit_user: false,
             operation: scard_core::ipc::HelperOperation::Unlock {
                 pin: Zeroizing::new(b"123456".to_vec()),
             },

@@ -20,7 +20,8 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::Storage::Xps::{EndDoc, EndPage, StartDocW, StartPage, DOCINFOW};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::Dialogs::{
-    PrintDlgW, PD_NOPAGENUMS, PD_NOSELECTION, PD_RETURNDC, PD_USEDEVMODECOPIESANDCOLLATE, PRINTDLGW,
+    PrintDlgW, PD_DISABLEPRINTTOFILE, PD_HIDEPRINTTOFILE, PD_NOPAGENUMS, PD_NOSELECTION,
+    PD_RETURNDC, PD_USEDEVMODECOPIESANDCOLLATE, PRINTDLGW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -494,7 +495,12 @@ unsafe fn print_recovery_sheet(hwnd: HWND, lines: &[Zeroizing<String>]) {
     let mut pd = PRINTDLGW {
         lStructSize: size_of::<PRINTDLGW>() as u32,
         hwndOwner: hwnd,
-        Flags: PD_RETURNDC | PD_NOPAGENUMS | PD_NOSELECTION | PD_USEDEVMODECOPIESANDCOLLATE,
+        Flags: PD_RETURNDC
+            | PD_NOPAGENUMS
+            | PD_NOSELECTION
+            | PD_USEDEVMODECOPIESANDCOLLATE
+            | PD_HIDEPRINTTOFILE
+            | PD_DISABLEPRINTTOFILE,
         nCopies: 1,
         ..Default::default()
     };
@@ -505,7 +511,7 @@ unsafe fn print_recovery_sheet(hwnd: HWND, lines: &[Zeroizing<String>]) {
     }
     let hdc: HDC = pd.hDC;
 
-    let doc_name = to_wide("FamiliarSmartcard Recovery Sheet");
+    let doc_name = to_wide("Familiar Smartcard Recovery Sheet");
     let di = DOCINFOW {
         cbSize: size_of::<DOCINFOW>() as i32,
         lpszDocName: PCWSTR(doc_name.as_ptr()),
@@ -532,7 +538,7 @@ unsafe fn print_recovery_sheet(hwnd: HWND, lines: &[Zeroizing<String>]) {
             let _ = MessageBoxW(
                 Some(hwnd),
                 w!("Recovery sheet sent to printer. Verify the physical printout before confirming."),
-                w!("FamiliarSmartcard"),
+                w!("Familiar Smartcard"),
                 MB_OK | MB_ICONINFORMATION,
             );
         }

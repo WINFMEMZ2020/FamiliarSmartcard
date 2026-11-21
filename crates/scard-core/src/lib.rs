@@ -25,7 +25,7 @@ pub use enroll::{
 };
 pub use error::{AuthError, Result};
 pub use piv::PinPukMetadata;
-pub use probe::{probe_readers, ReaderProbe, SlotProbe};
+pub use probe::{ensure_piv_card_present_in_session, probe_readers, ReaderProbe, SlotProbe};
 pub use typestate::{
     unlock, unlock_with_transport, AuthPipeline, CardConnected, CredentialDecrypted,
     FreshnessProven, KeyUnwrapped, PinVerified, PinVerifiedForUnwrap, VaultLoaded,

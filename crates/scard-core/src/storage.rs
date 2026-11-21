@@ -46,6 +46,7 @@ const VALUE_VAULT: &str = "VaultBlob";
 const VALUE_VAULT_PENDING: &str = "VaultBlob.pending";
 const VALUE_VAULT_BACKUP: &str = "VaultBlob.bak";
 const VALUE_TOUCH_POLICY: &str = "TouchPolicy";
+const VALUE_CARD_AUTH_9E_PUB: &str = "CardAuth9EPub";
 const VALUE_PINNED_F9: &str = "PinnedF9Fingerprint";
 
 const MAX_DPAPI_BLOB: usize = 4096;
@@ -472,6 +473,59 @@ pub fn write_vault(sid: &str, vault: &VaultBlob) -> Result<()> {
     let _ = VaultBlob::decode(&unprotected)?;
 
     delete_reg_value_ignore_missing(key.0, VALUE_VAULT_PENDING);
+    Ok(())
+}
+
+/// Overwrite and delete any residual `VaultBlob.bak` / `VaultBlob.pending` values
+/// once a new password rotation or re-bind has been verified via `LogonUserW`,
+/// ensuring historical human passwords never persist in the registry.
+pub fn purge_vault_backup(sid: &str) -> Result<()> {
+    let subkey = user_subkey_str(sid)?;
+    let Ok(key) = create_secured_hklm_key(&subkey) else {
+        return Ok(());
+    };
+    if let Ok(Some(existing)) = read_raw_reg_binary(&subkey, VALUE_VAULT_BACKUP, MAX_DPAPI_BLOB) {
+        let zeros = vec![0u8; existing.len()];
+        let _ = write_raw_reg_binary(key.0, VALUE_VAULT_BACKUP, &zeros);
+    }
+    delete_reg_value_ignore_missing(key.0, VALUE_VAULT_BACKUP);
+    delete_reg_value_ignore_missing(key.0, VALUE_VAULT_PENDING);
+    Ok(())
+}
+
+/// Read the optional 65-byte uncompressed P-256 public key for PIV slot `0x9E`
+/// (`Card Authentication`, `PIN=NEVER`), used to authenticate the physical card
+/// BEFORE transmitting the user's plaintext PIN or PUK.
+pub fn read_card_auth_9e_pub(sid: &str) -> Result<Option<Vec<u8>>> {
+    let subkey = user_subkey_str(sid)?;
+    let Some(bytes) = read_raw_reg_binary(&subkey, VALUE_CARD_AUTH_9E_PUB, 133)? else {
+        return Ok(None);
+    };
+    if crate::crypto::p256_public_from_sec1(&bytes).is_err() {
+        return Err(AuthError::Vault(
+            "corrupted CardAuth9EPub public key in registry".into(),
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+/// Persist the verified 65-byte uncompressed P-256 public key for slot `0x9E`.
+pub fn write_card_auth_9e_pub(sid: &str, pub_sec1: &[u8]) -> Result<()> {
+    let _ = crate::crypto::p256_public_from_sec1(pub_sec1)?;
+    ensure_secured_vault_hierarchy()?;
+    let subkey = user_subkey_str(sid)?;
+    let key = create_secured_hklm_key(&subkey)?;
+    write_raw_reg_binary(key.0, VALUE_CARD_AUTH_9E_PUB, pub_sec1)
+}
+
+/// Remove any stored `CardAuth9EPub` when re-enrolling with a card that does not
+/// have slot `0x9E` provisioned.
+pub fn clear_card_auth_9e_pub(sid: &str) -> Result<()> {
+    let subkey = user_subkey_str(sid)?;
+    let Ok(key) = create_secured_hklm_key(&subkey) else {
+        return Ok(());
+    };
+    delete_reg_value_ignore_missing(key.0, VALUE_CARD_AUTH_9E_PUB);
     Ok(())
 }
 
