@@ -236,6 +236,10 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
             return Ok(());
         }
 
+        scard_core::storage::debug_log(&format!(
+            "GetSerialization sid={} user={}",
+            self.sid, self.username
+        ));
         let vault = match scard_core::storage::read_vault(&self.sid) {
             Ok(Some(vault)) => vault,
             Ok(None) => {

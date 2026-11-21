@@ -19,6 +19,24 @@ const REG_PREFIX: &str = "SOFTWARE\\FamiliarSmartcard\\Users\\";
 const VALUE_NAME: &str = "VaultBlob";
 const MAX_DPAPI_BLOB: usize = 4096;
 
+/// Append a non-secret diagnostic line. Used by the Credential Provider because
+/// LogonUI has no console. The file is writable by SYSTEM/Administrators.
+pub fn debug_log(message: &str) {
+    use std::io::Write;
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(r"C:\Windows\Temp\familiar_cp.log")
+    {
+        let _ = writeln!(file, "{timestamp} {message}");
+    }
+}
+
 fn to_wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -34,6 +52,7 @@ fn entropy_for_sid(sid: &str) -> Vec<u8> {
 pub fn read_vault(sid: &str) -> Result<Option<VaultBlob>> {
     let subkey = subkey_for_sid(sid);
     let value = to_wide(VALUE_NAME);
+    debug_log(&format!("read_vault sid={sid}"));
 
     let mut len = 0u32;
     let status = unsafe {
@@ -47,6 +66,10 @@ pub fn read_vault(sid: &str) -> Result<Option<VaultBlob>> {
             Some(&mut len),
         )
     };
+    debug_log(&format!(
+        "read_vault first status=0x{:08X} len={len}",
+        status.0
+    ));
 
     if status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND {
         return Ok(None);
@@ -70,6 +93,10 @@ pub fn read_vault(sid: &str) -> Result<Option<VaultBlob>> {
             Some(&mut len),
         )
     };
+    debug_log(&format!(
+        "read_vault second status=0x{:08X} len={len}",
+        status.0
+    ));
     if status != ERROR_SUCCESS {
         return Err(AuthError::Registry(status.0 as i32));
     }
@@ -78,10 +105,12 @@ pub fn read_vault(sid: &str) -> Result<Option<VaultBlob>> {
     let entropy = entropy_for_sid(sid);
     let encoded = dpapi::unprotect(&buffer, &entropy)?;
     let vault = VaultBlob::decode(&encoded)?;
+    debug_log("read_vault dpapi+decode ok");
     Ok(Some(vault))
 }
 
 pub fn write_vault(sid: &str, vault: &VaultBlob) -> Result<()> {
+    debug_log(&format!("write_vault sid={sid}"));
     let encoded = vault.encode()?;
     let entropy = entropy_for_sid(sid);
     let protected = dpapi::protect(&encoded, &entropy)?;

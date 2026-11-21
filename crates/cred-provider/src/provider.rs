@@ -56,6 +56,9 @@ impl Provider {
                         Err(_) => String::new(),
                     };
                 let (domain, username) = split_qualified(&qualified);
+                scard_core::storage::debug_log(&format!(
+                    "provider user sid={sid} qualified={qualified}"
+                ));
                 let credential: ICredentialProviderCredential =
                     Credential::new(sid, domain, username, cpus).into();
                 result.push(credential);
