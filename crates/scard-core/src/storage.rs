@@ -68,14 +68,6 @@ const SDDL_PROGRAM_FILES_BINARIES: PCWSTR =
 const SDDL_COM_CLSID_READABLE: PCWSTR =
     w!("D:PAI(A;OICI;KA;;;SY)(A;OICI;KA;;;BA)(A;OICI;KR;;;BU)(A;OICI;KR;;;AC)(A;OICI;KR;;;LS)");
 
-/// Safe no-op diagnostic hook in production builds.
-///
-/// Replaces the insecure `C:\Windows\Temp\familiar_cp.log` writer so `SYSTEM`
-/// processes cannot be tricked into following symlinks/junctions or leaking
-/// account metadata to unprivileged local users.
-#[inline]
-pub fn debug_log(_message: &str) {}
-
 struct SecurityDescriptorGuard(PSECURITY_DESCRIPTOR);
 
 impl SecurityDescriptorGuard {

@@ -54,3 +54,4 @@ hex = "0.4"
 panic = "unwind"
 lto = "thin"
 codegen-units = 1
+strip = "symbols"

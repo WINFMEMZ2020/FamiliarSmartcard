@@ -49,6 +49,7 @@ fn find_source_binary(exe_dir: &Path, filename: &str) -> Option<PathBuf> {
     if direct.is_file() {
         return Some(direct);
     }
+    #[cfg(debug_assertions)]
     if let Some(parent) = exe_dir.parent() {
         for sub in ["release", "debug"] {
             let candidate = parent.join(sub).join(filename);

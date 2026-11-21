@@ -511,8 +511,8 @@ mod tests {
             alg: ALG_P256,
             fingerprint: &fingerprint,
             sid: "S-1-5-21-100",
-            username: "kasumi",
-            computer: "VM01",
+            username: "alice",
+            computer: "WORKSTATION",
             password_last_set: 1700000000,
         });
         let (ciphertext, tag) =
@@ -558,8 +558,8 @@ mod tests {
         let vault = build_test_vault(&card.public_sec1, "2345-6789-ABCD-EFGH");
         let pin = Zeroizing::new(b"123456".to_vec());
 
-        let pw =
-            unlock_with_transport(vault, "S-1-5-21-100", "kasumi", "VM01", &card, &pin).unwrap();
+        let pw = unlock_with_transport(vault, "S-1-5-21-100", "alice", "WORKSTATION", &card, &pin)
+            .unwrap();
         assert_eq!(pw.as_str(), "2345-6789-ABCD-EFGH");
         assert_eq!(*card.verify_calls.borrow(), 2);
     }
@@ -570,8 +570,15 @@ mod tests {
         let vault = build_test_vault(&card.public_sec1, "secret");
         let bad_pin = Zeroizing::new(b"999999".to_vec());
 
-        let err = unlock_with_transport(vault, "S-1-5-21-100", "kasumi", "VM01", &card, &bad_pin)
-            .unwrap_err();
+        let err = unlock_with_transport(
+            vault,
+            "S-1-5-21-100",
+            "alice",
+            "WORKSTATION",
+            &card,
+            &bad_pin,
+        )
+        .unwrap_err();
         assert!(matches!(err, AuthError::PinIncorrect(2)));
         assert_eq!(*card.verify_calls.borrow(), 1);
     }
@@ -582,7 +589,7 @@ mod tests {
         let vault = build_test_vault(&card.public_sec1, "secret");
         let pin = Zeroizing::new(b"123456".to_vec());
 
-        let err = unlock_with_transport(vault, "S-1-5-21-100", "kasumi", "VM01", &card, &pin)
+        let err = unlock_with_transport(vault, "S-1-5-21-100", "alice", "WORKSTATION", &card, &pin)
             .unwrap_err();
         assert!(matches!(err, AuthError::WrongCard));
         // Stopped before second VERIFY!
@@ -595,7 +602,7 @@ mod tests {
         let vault = build_test_vault(&card.public_sec1, "secret");
         let pin = Zeroizing::new(b"123456".to_vec());
 
-        let err = unlock_with_transport(vault, "S-1-5-21-100", "kasumi", "VM01", &card, &pin)
+        let err = unlock_with_transport(vault, "S-1-5-21-100", "alice", "WORKSTATION", &card, &pin)
             .unwrap_err();
         assert!(matches!(err, AuthError::Crypto(_)));
     }
@@ -606,7 +613,7 @@ mod tests {
         let vault = build_test_vault(&card.public_sec1, "secret");
         let pin = Zeroizing::new(b"123456".to_vec());
 
-        let err = unlock_with_transport(vault, "S-1-5-21-100", "kasumi", "VM01", &card, &pin)
+        let err = unlock_with_transport(vault, "S-1-5-21-100", "alice", "WORKSTATION", &card, &pin)
             .unwrap_err();
         assert!(matches!(err, AuthError::CardPolicy(_)));
         assert_eq!(*card.verify_calls.borrow(), 0);

@@ -308,8 +308,8 @@ mod tests {
     fn request_and_response_roundtrip() {
         let req = HelperRequest {
             sid: "S-1-5-21-1000-2000-3000-1001".into(),
-            username: "kasumi_virt".into(),
-            computer: "TESTVM".into(),
+            username: "alice".into(),
+            computer: "WORKSTATION".into(),
             operation: HelperOperation::Unlock {
                 pin: Zeroizing::new(b"123456".to_vec()),
             },
@@ -330,8 +330,8 @@ mod tests {
         // UnblockAndUnlock roundtrip
         let unblock_req = HelperRequest {
             sid: "S-1-5-21-1000-2000-3000-1001".into(),
-            username: "kasumi_virt".into(),
-            computer: "TESTVM".into(),
+            username: "alice".into(),
+            computer: "WORKSTATION".into(),
             operation: HelperOperation::UnblockAndUnlock {
                 puk: Zeroizing::new(b"12345678".to_vec()),
                 new_pin: Zeroizing::new(b"654321".to_vec()),

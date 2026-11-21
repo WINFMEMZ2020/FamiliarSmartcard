@@ -70,9 +70,9 @@ rescue_delete_cp.reg         # WinRE / 安全模式救援注册表文件
 
 ---
 
-## 3. 关于辅助入口 `Re-bind current password (Dev / Rescue)` 的风险说明（不推荐）
+## 3. 关于辅助入口 `Re-bind current password (Advanced / Rescue)` 的风险说明（不推荐）
 
-窗口保留了次级按钮 **`Re-bind current password (Dev / Rescue)`**，该入口**不修改系统密码**，直接将当前输入的密码加密进 Vault。
+窗口保留了次级按钮 **`Re-bind current password (Advanced / Rescue)`**，该入口**不修改系统密码**，直接将当前输入的密码加密进 Vault。
 
 ### 为什么正式环境强烈不推荐使用该入口？
 
@@ -139,7 +139,7 @@ rescue_delete_cp.reg         # WinRE / 安全模式救援注册表文件
    ```
 3. **支持两种远程锁屏形态**：
    - **显示已知用户头像时**：直接选中已绑定账户下的 `Sign in with Familiar Smartcard`，输入 PIN 登录。
-   - **开启了“不显示上次登录名”策略或点击左下角 `Other user` 时**：选中 `Sign in with Familiar Smartcard`，依次填入本地用户名（如 `kasumi_virt` 或 `.\kasumi_virt`）与 Familiar Smartcard PIN 即可登录。
+   - **开启了“不显示上次登录名”策略或点击左下角 `Other user` 时**：选中 `Sign in with Familiar Smartcard`，依次填入本地用户名（如 `alice` 或 `.\alice`）与 Familiar Smartcard PIN 即可登录。
 4. **防卡死超时保护**：每次认证由同会话隔离进程 `familiar-auth-helper.exe` 执行，默认 10 秒硬超时（Touch 策略卡片为 22 秒）。即使客户端拔卡或网络中断导致智能卡通道挂起，锁屏也会准时中断返回提示，随时可点击“Sign-in options”切回恢复单密码登录。
 
 ---

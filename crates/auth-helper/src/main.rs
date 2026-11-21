@@ -25,7 +25,9 @@ fn main() -> ExitCode {
     // written to standard streams.
     std::panic::set_hook(Box::new(|_| {}));
 
-    // Optional deterministic hang mode used ONLY by automated timeout tests.
+    // Deterministic hang hook compiled ONLY in debug/test builds (`cargo test`),
+    // completely stripped from `--release` production binaries.
+    #[cfg(debug_assertions)]
     if let Some(hang_arg) = std::env::args().nth(1) {
         if hang_arg == "--test-simulate-hang" {
             std::thread::sleep(std::time::Duration::from_secs(30));

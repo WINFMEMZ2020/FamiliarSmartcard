@@ -115,7 +115,12 @@ fn main() -> windows::core::Result<()> {
             }
             "--probe" => return probe_cli(),
             "--card-selftest" => {
-                let pin = args.get(2).map(String::as_str).unwrap_or("123456");
+                let Some(pin) = args.get(2).map(String::as_str) else {
+                    eprintln!("Usage: familiar-enroll.exe --card-selftest <PIN>\n");
+                    return Err(windows::core::Error::from_hresult(
+                        windows::Win32::Foundation::E_INVALIDARG,
+                    ));
+                };
                 return card_selftest_cli(pin);
             }
             "--repin-attestation" => return repin_attestation_cli(),
@@ -204,7 +209,7 @@ fn print_cli_help() {
          Usage:\n\
          \x20 familiar-enroll.exe                                Launch elevated Win32 setup GUI\n\
          \x20 familiar-enroll.exe --probe                        Read-only reader, PIN/PUK, 0x9D policy & 0xF9 attestation probe\n\
-         \x20 familiar-enroll.exe --card-selftest [PIN]          Stateless card ECDH/AES-GCM self-test (no registry writes)\n\
+         \x20 familiar-enroll.exe --card-selftest <PIN>          Stateless card ECDH/AES-GCM self-test (no registry writes)\n\
          \x20 familiar-enroll.exe --unblock-pin <PUK> <NEW-PIN>  Unblock PIV PIN via PUK (00 2C 00 80) and reset retries to 3\n\
          \x20 familiar-enroll.exe --change-puk <CUR> <NEW>       Change card PUK via 00 24 00 81 (PIV default: 12345678)\n\
          \x20 familiar-enroll.exe --repin-attestation            Verify & re-pin connected card's 0xF9 root in HKLM (Admin)\n\
@@ -562,7 +567,7 @@ unsafe fn create_controls(hwnd: HWND) {
         );
         set_font(password, font);
 
-        // Row 1: Primary enrollment vs Dev/Rescue re-bind
+        // Row 1: Primary enrollment vs Advanced/Rescue re-bind
         let btn_setup = create_control(
             hwnd,
             w!("BUTTON"),
@@ -578,10 +583,10 @@ unsafe fn create_controls(hwnd: HWND) {
         let btn_rebind = create_control(
             hwnd,
             w!("BUTTON"),
-            "Re-bind current password (Dev / Rescue)",
+            "Re-bind current password (Advanced / Rescue)",
             322,
             174,
-            275,
+            305,
             38,
             ID_REBIND_EXISTING as isize,
         );
@@ -1164,7 +1169,7 @@ unsafe fn start_rebind_existing_password(hwnd: HWND) {
             Some(hwnd),
             w!("Re-binding an existing password WITHOUT rotating to a high-entropy random recovery password is NOT RECOMMENDED for production.\r\n\r\n\
                 Because the native Windows password provider stays enabled as a recovery path, a weak or reused password can still be guessed at the lock screen (especially over non-NLA RDP).\r\n\r\n\
-                Only use this option in isolated development VMs or when re-binding an already-rotated recovery password.\r\n\r\n\
+                Only use this option when re-binding an already-rotated recovery password or inside isolated test environments.\r\n\r\n\
                 Proceed with re-binding the current password?"),
             w!("Security Warning — Re-bind Existing Password"),
             MB_YESNO | MB_ICONWARNING,

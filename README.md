@@ -59,8 +59,8 @@ Launch `familiar-enroll.exe` (requests UAC elevation automatically):
    - Validates the local Workgroup account, verifies `0x9D` (`ECCP256`, `PIN ALWAYS`, `On-card` when metadata is exposed, or standard `5F C1 0B` X.509 certificate) and `0xF9` attestation if supported, generates a **36-character unambiguous random password** (`XXXX-XXXX-...`), and runs a real card unlock self-test **before** changing your Windows password.
    - Displays (and optionally prints via direct GDI) the offline recovery sheet and requires typing the last 6 characters to confirm.
    - Atomically rotates the local password (`UF_DONT_EXPIRE_PASSWD`), commits the verified `VaultBlob`, and installs/registers the Credential Provider and helper in `C:\Program Files\FamiliarSmartcard\`.
-2. **`Re-bind current password (Dev / Rescue — Not Recommended for Production)`**:
-   - Binds the existing Windows password without rotating it. **Not recommended** outside isolated test VMs or post-rescue re-binding because the native Windows password tile remains enabled; a human-chosen password can still be guessed (especially when RDP NLA is disabled).
+2. **`Re-bind current password (Advanced / Rescue — Not Recommended for Production)`**:
+   - Binds the existing Windows password without rotating it. **Not recommended** outside post-rescue re-binding (when the account already uses a rotated recovery password) or isolated test environments because the native Windows password tile remains enabled; a human-chosen password can still be guessed (especially when RDP NLA is disabled).
 
 ## Security Notes
 

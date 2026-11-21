@@ -220,23 +220,23 @@ mod tests {
     #[test]
     fn pack_kerb_sets_message_type_and_rejects_u16_overflow() {
         let protected = vec![b'A' as u16, b'B' as u16, b'C' as u16];
-        let packed = pack_kerb("MYPC", "kasumi", &protected, CPUS_LOGON).unwrap();
+        let packed = pack_kerb("MYPC", "alice", &protected, CPUS_LOGON).unwrap();
         assert!(!packed.pointer.is_null());
-        let expected_len = std::mem::size_of::<KERB_INTERACTIVE_UNLOCK_LOGON>() + 8 + 12 + 6;
+        let expected_len = std::mem::size_of::<KERB_INTERACTIVE_UNLOCK_LOGON>() + 8 + 10 + 6;
         assert_eq!(packed.length as usize, expected_len);
         // SAFETY: Free test buffer allocated with `CoTaskMemAlloc`.
         unsafe {
             let hdr = &*(packed.pointer as *const KERB_INTERACTIVE_UNLOCK_LOGON);
             assert_eq!(hdr.Logon.MessageType, KerbInteractiveLogon);
             assert_eq!(hdr.Logon.LogonDomainName.Length, 8);
-            assert_eq!(hdr.Logon.UserName.Length, 12);
+            assert_eq!(hdr.Logon.UserName.Length, 10);
             assert_eq!(hdr.Logon.Password.Length, 6);
             CoTaskMemFree(Some(packed.pointer as *const c_void));
         }
 
         // Oversized password (> 65535 bytes = > 32767 u16s) must fail closed instead of truncating!
         let huge = vec![0x0041u16; 40_000];
-        let err = pack_kerb("MYPC", "kasumi", &huge, CPUS_LOGON)
+        let err = pack_kerb("MYPC", "alice", &huge, CPUS_LOGON)
             .err()
             .expect("oversized field must fail");
         assert_eq!(err.code(), E_INVALIDARG);
