@@ -420,13 +420,7 @@ fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Compute the approximate absolute password-set time from `USER_INFO_1::usri1_password_age`.
-///
-/// Brackets the `NetUserGetInfo` call with wall-clock reads and retries once if a
-/// concurrent NTP / VM wake clock jump occurred mid-call.
-pub fn password_last_set(username: &str) -> Result<u64> {
-    let username_w: Vec<u16> = username.encode_utf16().chain(std::iter::once(0)).collect();
-
+fn query_password_age_and_midpoint(username_w: &[u16]) -> Result<(u64, u64)> {
     for _ in 0..2 {
         let before = unix_now_secs();
         let mut buffer: *mut u8 = std::ptr::null_mut();
@@ -447,11 +441,51 @@ pub fn password_last_set(username: &str) -> Result<u64> {
 
         if after.abs_diff(before) <= 2 {
             let midpoint = before / 2 + after / 2 + (before & after & 1);
-            return Ok(midpoint.saturating_sub(age));
+            return Ok((midpoint, age));
         }
     }
 
     Err(AuthError::Internal(
         "system clock jumped repeatedly while querying password age".into(),
     ))
+}
+
+/// Compute the password-set marker for login / self-test comparison.
+///
+/// Important Windows SAM quirk: local accounts created during OOBE / `unattend.xml`
+/// whose password has never been rotated via SAM password-change APIs have
+/// `PasswordLastSet == 0` in SAM, causing `usri1_password_age` to remain `0`
+/// permanently. Returning sentinel `0` when `age == 0` prevents `now - 0` from
+/// drifting with the wall clock and falsely reporting `PasswordChanged` after 10s.
+pub fn password_last_set(username: &str) -> Result<u64> {
+    let username_w: Vec<u16> = username.encode_utf16().chain(std::iter::once(0)).collect();
+    let (midpoint, age) = query_password_age_and_midpoint(&username_w)?;
+    if age == 0 {
+        return Ok(0);
+    }
+    Ok(midpoint.saturating_sub(age))
+}
+
+/// Compute the static `password_last_set` marker at enrollment / rotation time.
+///
+/// Distinguishes two `usri1_password_age == 0` states by waiting 1.1s once when `age == 0`:
+/// - Just-rotated password (`NetUserSetInfo` <1s ago): `age` advances to `>= 1`,
+///   yielding the real Unix timestamp `midpoint - age > 0`.
+/// - OOBE / un-aged password (`SAM.PasswordLastSet == 0`): `age` remains `0`,
+///   yielding stable sentinel `0` so `Re-bind current password` works indefinitely
+///   while still catching any future password change (`0 -> non-zero`).
+pub fn password_last_set_for_enrollment(username: &str) -> Result<u64> {
+    let username_w: Vec<u16> = username.encode_utf16().chain(std::iter::once(0)).collect();
+    let (midpoint, age) = query_password_age_and_midpoint(&username_w)?;
+    if age > 0 {
+        return Ok(midpoint.saturating_sub(age));
+    }
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let (midpoint2, age2) = query_password_age_and_midpoint(&username_w)?;
+    if age2 > 0 {
+        Ok(midpoint2.saturating_sub(age2))
+    } else {
+        Ok(0)
+    }
 }

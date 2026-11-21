@@ -306,9 +306,13 @@ pub fn aad_wrap(
 }
 
 /// Windows reports `usri1_password_age` as relative seconds; `now - age`
-/// contains second-boundary jitter. Compare the derived timestamp with the
-/// static enrollment value using a small tolerance.
+/// contains second-boundary jitter. Sentinel `0` represents an account whose
+/// SAM `PasswordLastSet` has never been initialized (`age == 0` permanently)
+/// and only matches `0`.
 pub fn password_last_set_matches(stored: u64, current: u64) -> bool {
+    if stored == 0 || current == 0 {
+        return stored == current;
+    }
     stored.abs_diff(current) <= PASSWORD_LAST_SET_TOLERANCE_SECS
 }
 
@@ -435,6 +439,10 @@ mod tests {
 
     #[test]
     fn password_last_set_tolerance() {
+        assert!(password_last_set_matches(0, 0));
+        assert!(!password_last_set_matches(0, 5));
+        assert!(!password_last_set_matches(5, 0));
+        assert!(!password_last_set_matches(0, 1_700_000_000));
         assert!(password_last_set_matches(1000, 1010));
         assert!(password_last_set_matches(1000, 990));
         assert!(!password_last_set_matches(1000, 1011));

@@ -6,7 +6,8 @@
 use std::ffi::c_void;
 use std::sync::{Mutex, MutexGuard};
 use windows::core::{
-    implement, interface, Error as WinError, Ref, Result as WinResult, BOOL, HRESULT, PCWSTR, PWSTR,
+    implement, interface, w, Error as WinError, IUnknownImpl, Ref, Result as WinResult, BOOL,
+    HRESULT, PCWSTR, PWSTR,
 };
 use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY, S_FALSE, S_OK};
 use windows::Win32::Graphics::Gdi::{
@@ -125,7 +126,7 @@ impl Credential {
         matches!(self.mode, TargetMode::ExplicitUser)
     }
 
-    fn clear_pin(&self) {
+    fn clear_pin_memory(&self) {
         let mut guard = self.lock_inner();
         guard.pin.clear();
     }
@@ -137,6 +138,33 @@ impl Credential {
 
     fn status_text(&self) -> String {
         self.lock_inner().status.clone()
+    }
+}
+
+impl Drop for Credential {
+    fn drop(&mut self) {
+        self.clear_pin_memory();
+    }
+}
+
+impl Credential_Impl {
+    /// Zeroize the internal PIN buffer AND notify `LogonUI.exe` via
+    /// `ICredentialProviderCredentialEvents::SetFieldString` so the visual
+    /// password box on the lock screen never retains stale `••••••` dots.
+    fn clear_pin_and_notify_ui(&self) {
+        let events_opt = {
+            let mut guard = self.lock_inner();
+            guard.pin.clear();
+            guard.events.clone()
+        };
+        if let Some(events) = events_opt {
+            let this_cpc: ICredentialProviderCredential = self.to_interface();
+            // SAFETY: Invoked outside `self.inner` Mutex so any synchronous callback
+            // from `LogonUI.exe` into `GetStringValue(SFI_PIN)` cannot deadlock.
+            unsafe {
+                let _ = events.SetFieldString(&this_cpc, SFI_PIN, w!(""));
+            }
+        }
     }
 
     unsafe fn fail(
@@ -154,13 +182,7 @@ impl Credential {
                 *pcpsi = icon;
             }
         }
-        self.clear_pin();
-    }
-}
-
-impl Drop for Credential {
-    fn drop(&mut self) {
-        self.clear_pin();
+        self.clear_pin_and_notify_ui();
     }
 }
 
@@ -180,13 +202,18 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
     }
 
     fn SetSelected(&self) -> WinResult<BOOL> {
-        // Never auto-logon.
-        Ok(BOOL(0))
+        guard_com(|| {
+            // Clear any leftover PIN visually whenever the tile is (re-)selected
+            // (for example, after dismissing an error screen with OK).
+            self.clear_pin_and_notify_ui();
+            // Never auto-logon.
+            Ok(BOOL(0))
+        })
     }
 
     fn SetDeselected(&self) -> WinResult<()> {
         guard_com(|| {
-            self.clear_pin();
+            self.clear_pin_and_notify_ui();
             Ok(())
         })
     }
@@ -207,6 +234,8 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
         }
 
         guard_com(|| {
+            let explicit_needs_username =
+                self.is_explicit_user() && self.lock_inner().typed_username.is_empty();
             let (state, interactive) = match dwfieldid {
                 // `CPFS_DISPLAY_IN_BOTH` is required by Windows 10/11 XAML LogonUI so the
                 // "Sign-in options" icon bar renders our credential switch button!
@@ -214,17 +243,23 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
                 SFI_LABEL | SFI_SUBMIT => (CPFS_DISPLAY_IN_SELECTED_TILE, CPFIS_NONE),
                 SFI_USERNAME => {
                     if self.is_explicit_user() {
-                        (CPFS_DISPLAY_IN_SELECTED_TILE, CPFIS_FOCUSED)
+                        let focus = if explicit_needs_username {
+                            CPFIS_FOCUSED
+                        } else {
+                            CPFIS_NONE
+                        };
+                        (CPFS_DISPLAY_IN_SELECTED_TILE, focus)
                     } else {
                         (CPFS_HIDDEN, CPFIS_NONE)
                     }
                 }
                 SFI_PIN => {
-                    if self.is_explicit_user() {
-                        (CPFS_DISPLAY_IN_SELECTED_TILE, CPFIS_NONE)
+                    let focus = if explicit_needs_username {
+                        CPFIS_NONE
                     } else {
-                        (CPFS_DISPLAY_IN_SELECTED_TILE, CPFIS_FOCUSED)
-                    }
+                        CPFIS_FOCUSED
+                    };
+                    (CPFS_DISPLAY_IN_SELECTED_TILE, focus)
                 }
                 SFI_STATUS => {
                     if self.status_text().is_empty() {
@@ -532,7 +567,7 @@ impl ICredentialProviderCredential_Impl for Credential_Impl {
                 *pcpgsr = CPGSR_RETURN_CREDENTIAL_FINISHED;
             }
             self.set_status("Signing in...".into());
-            self.clear_pin();
+            self.clear_pin_and_notify_ui();
             Ok(())
         })
     }
@@ -804,6 +839,162 @@ mod tests {
                 .code(),
                 E_INVALIDARG
             );
+        }
+    }
+
+    #[implement(ICredentialProviderCredentialEvents)]
+    struct MockCredentialEvents {
+        string_updates: std::sync::Arc<Mutex<Vec<(u32, String)>>>,
+    }
+
+    impl windows::Win32::UI::Shell::ICredentialProviderCredentialEvents_Impl
+        for MockCredentialEvents_Impl
+    {
+        fn SetFieldState(
+            &self,
+            _pcpc: Ref<'_, ICredentialProviderCredential>,
+            _dwfieldid: u32,
+            _cpfs: CREDENTIAL_PROVIDER_FIELD_STATE,
+        ) -> WinResult<()> {
+            Ok(())
+        }
+
+        fn SetFieldInteractiveState(
+            &self,
+            _pcpc: Ref<'_, ICredentialProviderCredential>,
+            _dwfieldid: u32,
+            _cpfis: CREDENTIAL_PROVIDER_FIELD_INTERACTIVE_STATE,
+        ) -> WinResult<()> {
+            Ok(())
+        }
+
+        fn SetFieldString(
+            &self,
+            _pcpc: Ref<'_, ICredentialProviderCredential>,
+            dwfieldid: u32,
+            psz: &PCWSTR,
+        ) -> WinResult<()> {
+            let val = if psz.is_null() {
+                String::new()
+            } else {
+                // SAFETY: `psz` is a valid NUL-terminated UTF-16 string passed by `Credential`.
+                unsafe { psz.to_string() }.unwrap_or_default()
+            };
+            self.string_updates.lock().unwrap().push((dwfieldid, val));
+            Ok(())
+        }
+
+        fn SetFieldCheckbox(
+            &self,
+            _pcpc: Ref<'_, ICredentialProviderCredential>,
+            _dwfieldid: u32,
+            _bchecked: BOOL,
+            _pszlabel: &PCWSTR,
+        ) -> WinResult<()> {
+            Ok(())
+        }
+
+        fn SetFieldBitmap(
+            &self,
+            _pcpc: Ref<'_, ICredentialProviderCredential>,
+            _dwfieldid: u32,
+            _hbmp: HBITMAP,
+        ) -> WinResult<()> {
+            Ok(())
+        }
+
+        fn SetFieldComboBoxSelectedItem(
+            &self,
+            _pcpc: Ref<'_, ICredentialProviderCredential>,
+            _dwfieldid: u32,
+            _dwselecteditem: u32,
+        ) -> WinResult<()> {
+            Ok(())
+        }
+
+        fn DeleteFieldComboBoxItem(
+            &self,
+            _pcpc: Ref<'_, ICredentialProviderCredential>,
+            _dwfieldid: u32,
+            _dwitem: u32,
+        ) -> WinResult<()> {
+            Ok(())
+        }
+
+        fn AppendFieldComboBoxItem(
+            &self,
+            _pcpc: Ref<'_, ICredentialProviderCredential>,
+            _dwfieldid: u32,
+            _pszitem: &PCWSTR,
+        ) -> WinResult<()> {
+            Ok(())
+        }
+
+        fn SetFieldSubmitButton(
+            &self,
+            _pcpc: Ref<'_, ICredentialProviderCredential>,
+            _dwfieldid: u32,
+            _dwadjacentto: u32,
+        ) -> WinResult<()> {
+            Ok(())
+        }
+
+        fn OnCreatingWindow(&self) -> WinResult<windows::Win32::Foundation::HWND> {
+            Err(E_NOTIMPL.into())
+        }
+    }
+
+    #[test]
+    fn failed_login_and_reselection_clear_pin_via_set_field_string_event() {
+        let updates = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let events: ICredentialProviderCredentialEvents = MockCredentialEvents {
+            string_updates: updates.clone(),
+        }
+        .into();
+
+        let cred: ICredentialProviderCredential = Credential::new_explicit_user(CPUS_LOGON).into();
+        // SAFETY: Standard COM calls in unit test.
+        unsafe {
+            cred.Advise(&events).unwrap();
+
+            // Simulate user typing username + PIN, then failing sign-in (e.g., non-existent/unbound user
+            // or missing card).
+            cred.SetStringValue(SFI_USERNAME, w!("__nonexistent_fsc_test_user__"))
+                .unwrap();
+            cred.SetStringValue(SFI_PIN, w!("123456")).unwrap();
+
+            let mut cpgsr = CPGSR_RETURN_CREDENTIAL_FINISHED;
+            let mut cpcs = CREDENTIAL_PROVIDER_CREDENTIAL_SERIALIZATION::default();
+            let mut status_pwstr = PWSTR::null();
+            let mut icon = CPSI_NONE;
+            cred.GetSerialization(&mut cpgsr, &mut cpcs, &mut status_pwstr, &mut icon)
+                .unwrap();
+            assert_eq!(cpgsr, CPGSR_NO_CREDENTIAL_NOT_FINISHED);
+            if !status_pwstr.is_null() {
+                CoTaskMemFree(Some(status_pwstr.0 as *const c_void));
+            }
+
+            // Internal PIN buffer must be empty AND LogonUI must have received SetFieldString(SFI_PIN, "").
+            let pin_after = cred.GetStringValue(SFI_PIN).unwrap();
+            assert_eq!(pin_after.to_string().unwrap(), "");
+            CoTaskMemFree(Some(pin_after.0 as *const c_void));
+            assert_eq!(updates.lock().unwrap().as_slice(), &[(SFI_PIN, "".into())]);
+
+            // Username stays preserved, and focus shifts to PIN so returning from OK lets the user
+            // immediately type their PIN again!
+            let mut state = CPFS_HIDDEN;
+            let mut inter = CPFIS_NONE;
+            cred.GetFieldState(SFI_PIN, &mut state, &mut inter).unwrap();
+            assert_eq!(inter, CPFIS_FOCUSED);
+
+            // Simulate SetSelected on return to tile: must also notify SetFieldString(SFI_PIN, "").
+            updates.lock().unwrap().clear();
+            cred.SetStringValue(SFI_PIN, w!("654321")).unwrap();
+            let auto_logon = cred.SetSelected().unwrap();
+            assert!(!auto_logon.as_bool());
+            assert_eq!(updates.lock().unwrap().as_slice(), &[(SFI_PIN, "".into())]);
+
+            cred.UnAdvise().unwrap();
         }
     }
 }

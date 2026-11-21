@@ -10,8 +10,8 @@ mod recovery;
 
 use recovery::{confirm_recovery_sheet, RecoverySheet};
 use scard_core::account::{
-    password_last_set, rotate_local_password_and_disable_expiry, verify_local_workgroup_account,
-    UserInfo,
+    password_last_set, password_last_set_for_enrollment, rotate_local_password_and_disable_expiry,
+    verify_local_workgroup_account, UserInfo,
 };
 use scard_core::crypto::generate_recovery_password;
 use scard_core::enroll::{
@@ -975,7 +975,8 @@ unsafe fn commit_confirmed_rotation(hwnd: HWND, prepared: PreparedRotation) {
         // verified on their offline recovery sheet), and the Credential Provider is ALREADY
         // installed. Re-bind AAD with the new timestamp using the retained `Zeroizing` DEK.
         let commit_res: Result<(), String> = (|| {
-            let new_last_set = password_last_set(&user.username).map_err(|e| e.to_string())?;
+            let new_last_set =
+                password_last_set_for_enrollment(&user.username).map_err(|e| e.to_string())?;
             let final_vault = prepared
                 .candidate_vault
                 .reencrypt_password_with_dek(
@@ -1110,7 +1111,8 @@ unsafe fn start_rebind_existing_password(hwnd: HWND) {
                 verify_local_workgroup_account(&user.username).map_err(|e| e.to_string())?;
             validate_windows_password(&user, &password)
                 .map_err(|e| format!("Windows password validation failed: {e}"))?;
-            let last_set = password_last_set(&user.username).map_err(|e| e.to_string())?;
+            let last_set =
+                password_last_set_for_enrollment(&user.username).map_err(|e| e.to_string())?;
 
             let enrolled = enroll_with_options(&EnrollOptions {
                 reader: None,
